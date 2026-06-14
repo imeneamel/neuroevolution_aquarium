@@ -1,0 +1,1245 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aquarium Évolutif</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #020810;
+    --panel: #050d18;
+    --border: #0a1e30;
+    --text: #b8d4e8;
+    --muted: #3a5a75;
+    --accent: #00b4d8;
+    --font-ui: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    --font-label: system-ui, -apple-system, sans-serif;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-ui);
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 18px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    flex-shrink: 0;
+  }
+  .title-block { display: flex; align-items: baseline; gap: 12px; }
+  h1 {
+    font-family: var(--font-label);
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .subtitle { font-size: 10px; color: var(--muted); }
+  .controls { display: flex; gap: 8px; align-items: center; }
+  button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: 11px;
+    padding: 4px 11px;
+    cursor: pointer;
+    transition: border-color .15s, color .15s;
+    border-radius: 2px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.active { border-color: var(--accent); color: var(--accent); background: rgba(0,180,216,.07); }
+
+  .speed-label { font-size: 10px; color: var(--muted); }
+
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  .canvas-wrap { position: relative; flex: 1; overflow: hidden; }
+  canvas#aquarium { width: 100%; height: 100%; display: block; }
+
+  .panel {
+    width: 272px; flex-shrink: 0;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .panel-section {
+    padding: 13px 15px;
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-section:last-child { border-bottom: none; flex: 1; overflow-y: auto; }
+  .section-title {
+    font-size: 9px; letter-spacing: 0.18em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: 11px;
+  }
+
+  .lineage-card {
+    margin-bottom: 11px; padding: 9px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--lcolor);
+    background: rgba(255,255,255,.012);
+    border-radius: 2px;
+  }
+  .lineage-header {
+    display: flex; align-items: center;
+    justify-content: space-between; margin-bottom: 5px;
+  }
+  .lineage-name {
+    font-size: 12px; font-weight: 600;
+    color: var(--lcolor); font-family: var(--font-label);
+  }
+  .lineage-status { font-size: 9px; color: var(--muted); }
+  .stat-row {
+    display: flex; justify-content: space-between;
+    font-size: 10px; color: var(--muted); margin-bottom: 2px;
+  }
+  .stat-val { color: var(--text); }
+  .mini-chart { margin-top: 6px; }
+  canvas.sparkline { width: 100%; height: 26px; display: block; }
+  .behav-tag {
+    font-size: 9px; padding: 2px 5px; border: 1px solid;
+    display: inline-block; margin-top: 5px;
+    border-radius: 2px; letter-spacing: .04em;
+  }
+
+  .global-stat {
+    display: flex; justify-content: space-between;
+    font-size: 10px; margin-bottom: 4px;
+  }
+  .global-stat .val { color: var(--accent); }
+
+  #tooltip {
+    position: absolute; background: rgba(2,8,16,.96);
+    border: 1px solid var(--border); color: var(--text);
+    font-size: 10px; padding: 7px 11px; pointer-events: none;
+    display: none; z-index: 10; line-height: 1.7; border-radius: 2px;
+  }
+
+  .legend {
+    position: absolute; bottom: 12px; left: 12px;
+    display: flex; gap: 12px; flex-wrap: wrap;
+  }
+  .leg-item { display: flex; align-items: center; gap: 5px; font-size: 9px; color: var(--muted); }
+  .leg-dot { width: 7px; height: 7px; border-radius: 50%; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title-block">
+    <h1>AQUARIUM ÉVOLUTIF</h1>
+    <span class="subtitle">5 lignées · comportements générationnels</span>
+  </div>
+  <div class="controls">
+    <span class="speed-label">vitesse</span>
+    <button id="btn1x" class="active" onclick="setSpeed(1)">×1</button>
+    <button id="btn3x" onclick="setSpeed(3)">×3</button>
+    <button id="btn10x" onclick="setSpeed(10)">×10</button>
+    <button onclick="resetSim()">↺ reset</button>
+    <button id="btnPause" onclick="togglePause()">⏸ pause</button>
+  </div>
+</header>
+
+<div class="main">
+  <div class="canvas-wrap">
+    <canvas id="aquarium"></canvas>
+    <div class="legend">
+      <div class="leg-item"><div class="leg-dot" style="background:#39ff8a"></div>nourriture</div>
+      <div class="leg-item"><div class="leg-dot" style="background:#cc2020;clip-path:polygon(50% 0%,100% 100%,0% 100%)"></div>prédateur</div>
+    </div>
+    <div id="tooltip"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-section">
+      <div class="section-title">simulation</div>
+      <div class="global-stat"><span>tick</span><span class="val" id="gTick">0</span></div>
+      <div class="global-stat"><span>vivants</span><span class="val" id="gAlive">5 / 5</span></div>
+      <div class="global-stat"><span>nourriture</span><span class="val" id="gFood">—</span></div>
+      <div class="global-stat"><span>génération</span><span class="val" id="gGen">post-évolution</span></div>
+    </div>
+    <div class="panel-section" style="flex:1;overflow-y:auto">
+      <div class="section-title">lignées</div>
+      <div id="lineageCards"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════════
+//  MLP — miroir (version HTML) — INPUT_SIZE=10 pour correspondre à evolution.py v2
+// ══════════════════════════════════════════════════════════════
+const INPUT_SIZE = 10, HIDDEN_SIZE = 14, OUTPUT_SIZE = 4;
+
+function mlpForward(weights, x) {
+  let idx = 0;
+  const W1 = [], b1 = [], W2 = [], b2 = [];
+  for (let j = 0; j < HIDDEN_SIZE; j++) {
+    W1.push([]);
+    for (let i = 0; i < INPUT_SIZE; i++) W1[j].push(weights[idx++]);
+  }
+  for (let j = 0; j < HIDDEN_SIZE; j++) b1.push(weights[idx++]);
+  for (let j = 0; j < OUTPUT_SIZE; j++) {
+    W2.push([]);
+    for (let i = 0; i < HIDDEN_SIZE; i++) W2[j].push(weights[idx++]);
+  }
+  for (let j = 0; j < OUTPUT_SIZE; j++) b2.push(weights[idx++]);
+
+  const h = [];
+  for (let j = 0; j < HIDDEN_SIZE; j++) {
+    let s = b1[j];
+    for (let i = 0; i < INPUT_SIZE; i++) s += x[i] * W1[j][i];
+    h.push(Math.tanh(s));
+  }
+  const out = [];
+  for (let j = 0; j < OUTPUT_SIZE; j++) {
+    let s = b2[j];
+    for (let i = 0; i < HIDDEN_SIZE; i++) s += h[i] * W2[j][i];
+    out.push(Math.tanh(s));
+  }
+  return out;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Constantes monde
+// ══════════════════════════════════════════════════════════════
+const W = 800, H = 600;
+const FOOD_R = 9, PRED_R = 16, FISH_R = 9;
+const FISH_SPEED = 2.5, FLEE_SPEED = 3.8;
+const PRED_SPEED = 1.7;
+const N_FOOD = 18, N_PRED = 2;
+const CYCLE = 3600, ACTIVE = 300;
+const AGGRO_RANGE = 230, ABANDON_DIST = 270, MAX_CHASE_TICKS = 200, PANIC_DIST = 105;
+
+let lineageData = null;
+let fishes = [], foods = [], preds = [];
+let tick = 0, paused = false, speed = 1;
+let hoveredFish = null;
+
+const canvas = document.getElementById('aquarium');
+const ctx = canvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+
+function resizeCanvas() {
+  const wrap = canvas.parentElement;
+  canvas.width = wrap.clientWidth;
+  canvas.height = wrap.clientHeight;
+}
+
+function behaviourLabel(lineage) {
+  const c = lineage.context;
+  const tags = [];
+  if (c.predator_aggro >= 2.0) tags.push({ text: 'TRAUMATISÉ', color: '#e74c3c' });
+  else if (c.predator_aggro <= 1.2) tags.push({ text: 'CONFIANT', color: '#2ecc71' });
+  if (c.food_density === 'rich') tags.push({ text: 'BIEN NOURRI', color: '#f39c12' });
+  if (c.food_density === 'sparse') tags.push({ text: 'CHASSEUR', color: '#e67e22' });
+  return tags;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Spawn world
+// ══════════════════════════════════════════════════════════════
+function spawnWorld() {
+  if (!lineageData) return;
+  fishes = []; foods = []; preds = []; tick = 0;
+
+  const names = Object.keys(lineageData.lineages);
+  names.forEach((name, i) => {
+    const lin = lineageData.lineages[name];
+    const angle = (i / names.length) * Math.PI * 2;
+    const r = Math.min(W, H) * 0.28;
+    fishes.push({
+      name, color: lin.color, weights: lin.weights,
+      x: W/2 + Math.cos(angle) * r,
+      y: H/2 + Math.sin(angle) * r,
+      vx: 0, vy: 0,
+      angle: angle + Math.PI,
+      tailPhase: Math.random() * Math.PI * 2,
+      tailAmp: 0,
+      alive: true,
+      foodEaten: 0, stepsSurvived: 0, distanceTraveled: 0,
+      fear: 0,
+      finalFitness: lin.final_fitness,
+      context: lin.context,
+      history: lin.history,
+      // trail
+      trail: [],
+    });
+  });
+
+  for (let i = 0; i < N_FOOD; i++) spawnFood();
+
+  for (let i = 0; i < N_PRED; i++) {
+    preds.push({
+      x: (i === 0 ? 0.15 : 0.85) * W,
+      y: H * 0.5,
+      angle: i === 0 ? 0 : Math.PI,
+      vx: 0, vy: 0,
+      active: false,
+      chaseTicks: 0,
+      tailPhase: 0,
+    });
+  }
+}
+
+function spawnFood() {
+  foods.push({
+    x: Math.random() * (W-40) + 20,
+    y: Math.random() * (H-40) + 20,
+    eaten: false,
+    phase: Math.random() * Math.PI * 2,
+    size: 0.75 + Math.random() * 0.5,
+    type: Math.floor(Math.random() * 3), // 0=pellet, 1=algue, 2=plancton
+  });
+}
+
+function dist(x1,y1,x2,y2) { return Math.sqrt((x1-x2)**2+(y1-y2)**2); }
+
+// ══════════════════════════════════════════════════════════════
+//  Simulation step
+// ══════════════════════════════════════════════════════════════
+function simStep() {
+  tick++;
+  const cyclePos = tick % CYCLE;
+  const predWindowActive = cyclePos < ACTIVE;
+  const aliveFishes = fishes.filter(f => f.alive);
+
+  // ── Prédateurs ──
+  preds.forEach(pred => {
+    pred.tailPhase += 0.12;
+    if (predWindowActive) {
+      if (!pred.active && cyclePos === 0) {
+        pred.active = true;
+        pred.chaseTicks = 0;
+        pred.x = Math.random() < 0.5 ? Math.random() * 60 : W - Math.random() * 60;
+        pred.y = Math.random() * H;
+      }
+    } else {
+      pred.active = false;
+    }
+
+    if (!pred.active) {
+      pred.vx = pred.vx * 0.96 + (Math.random()-0.5) * 0.3;
+      pred.vy = pred.vy * 0.96 + (Math.random()-0.5) * 0.3;
+      pred.x = Math.max(5, Math.min(W-5, pred.x + pred.vx));
+      pred.y = Math.max(5, Math.min(H-5, pred.y + pred.vy));
+      if (Math.abs(pred.vx) > 0.05 || Math.abs(pred.vy) > 0.05)
+        pred.angle = Math.atan2(pred.vy, pred.vx);
+      return;
+    }
+
+    if (aliveFishes.length === 0) return;
+    let target = aliveFishes[0], minD = Infinity;
+    aliveFishes.forEach(f => { const d = dist(pred.x,pred.y,f.x,f.y); if (d < minD){ minD=d; target=f; } });
+
+    if (minD < AGGRO_RANGE) {
+      const dx = target.x - pred.x, dy = target.y - pred.y;
+      const d = Math.max(Math.sqrt(dx*dx+dy*dy), 1);
+      pred.vx = pred.vx * 0.7 + (dx/d) * PRED_SPEED * 0.3;
+      pred.vy = pred.vy * 0.7 + (dy/d) * PRED_SPEED * 0.3;
+      pred.angle = Math.atan2(dy, dx);
+      pred.chaseTicks++;
+      if (minD > ABANDON_DIST || pred.chaseTicks > MAX_CHASE_TICKS) { pred.active = false; pred.chaseTicks = 0; }
+    } else {
+      pred.vx = pred.vx * 0.9 + (Math.random()-0.5) * 2;
+      pred.vy = pred.vy * 0.9 + (Math.random()-0.5) * 2;
+    }
+    pred.x = Math.max(5, Math.min(W-5, pred.x + pred.vx));
+    pred.y = Math.max(5, Math.min(H-5, pred.y + pred.vy));
+  });
+
+  // ── Poissons ──
+  fishes.forEach(fish => {
+    if (!fish.alive) return;
+    fish.stepsSurvived++;
+    fish.tailPhase += 0.18;
+
+    const aliveFoods = foods.filter(f => !f.eaten);
+
+    let fdDx = 0, fdDy = 0, fdDist = 1;
+    if (aliveFoods.length > 0) {
+      let closest = aliveFoods[0], minD2 = Infinity;
+      aliveFoods.forEach(f => { const d2 = dist(fish.x,fish.y,f.x,f.y); if (d2 < minD2){ minD2=d2; closest=f; } });
+      fdDx = (closest.x - fish.x) / W;
+      fdDy = (closest.y - fish.y) / H;
+      fdDist = Math.min(minD2 / (W*0.5), 1);
+    }
+
+    let pdDx = 0, pdDy = 0, pdDist = 1;
+    let closestPred = null, minPD = Infinity;
+    preds.forEach(p => { const d = dist(fish.x,fish.y,p.x,p.y); if (d < minPD){ minPD=d; closestPred=p; } });
+    if (closestPred) {
+      pdDx = (closestPred.x - fish.x) / W;
+      pdDy = (closestPred.y - fish.y) / H;
+      pdDist = Math.min(minPD / (W*0.5), 1);
+    }
+
+    const predWindowActive2 = (tick % CYCLE) < ACTIVE;
+    const isPredActive = closestPred && closestPred.active;
+
+    const inputs = [
+      fdDx, fdDy, fdDist,
+      pdDx, pdDy, pdDist,
+      fish.x / W, fish.y / H,
+      fish.fear,
+      isPredActive ? 1.0 : 0.0,
+    ];
+
+    const out = mlpForward(fish.weights, inputs);
+    let dx2 = (out[3] - out[2]) * FISH_SPEED;
+    let dy2 = (out[0] - out[1]) * FISH_SPEED;
+
+    // fuite réflexe
+    if (closestPred && closestPred.active && minPD < PANIC_DIST) {
+      const dxp = fish.x - closestPred.x;
+      const dyp = fish.y - closestPred.y;
+      const d = Math.max(Math.sqrt(dxp*dxp+dyp*dyp),1);
+      dx2 = (dxp/d) * FLEE_SPEED;
+      dy2 = (dyp/d) * FLEE_SPEED;
+    }
+
+    // inertie douce
+    fish.vx = fish.vx * 0.55 + dx2 * 0.45;
+    fish.vy = fish.vy * 0.55 + dy2 * 0.45;
+
+    const prevX = fish.x, prevY = fish.y;
+    fish.x = Math.max(5, Math.min(W-5, fish.x + fish.vx));
+    fish.y = Math.max(5, Math.min(H-5, fish.y + fish.vy));
+
+    const moved = Math.sqrt((fish.x-prevX)**2+(fish.y-prevY)**2);
+    fish.distanceTraveled += moved;
+    fish.tailAmp = Math.min(1, fish.tailAmp * 0.9 + moved * 0.15);
+
+    if (Math.abs(fish.vx) > 0.05 || Math.abs(fish.vy) > 0.05)
+      fish.angle = Math.atan2(fish.vy, fish.vx);
+
+    // trail
+    fish.trail.push({ x: fish.x, y: fish.y });
+    if (fish.trail.length > 18) fish.trail.shift();
+
+    // manger
+    aliveFoods.forEach(f => {
+      if (!f.eaten && dist(fish.x,fish.y,f.x,f.y) < FISH_R + FOOD_R) {
+        f.eaten = true; fish.foodEaten++; spawnFood();
+      }
+    });
+
+    // collision prédateur
+    preds.forEach(pred => {
+      if (pred.active && dist(fish.x,fish.y,pred.x,pred.y) < FISH_R + PRED_R)
+        fish.alive = false;
+    });
+
+    // peur
+    if (closestPred && closestPred.active && minPD < 210)
+      fish.fear = Math.min(1, fish.fear + 0.32 * (1 - pdDist));
+    else
+      fish.fear = Math.max(0, fish.fear - 0.04);
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Décor statique (généré une fois)
+// ══════════════════════════════════════════════════════════════
+const CORALS = [];
+const ROCKS = [];
+const SAND_RIPPLES = [];
+
+function generateDecor() {
+  // Coraux
+  const coralColors = ['#ff6b6b','#ff9f43','#ffd32a','#c8d6e5','#a29bfe','#fd79a8','#00b894'];
+  for (let i = 0; i < 12; i++) {
+    CORALS.push({
+      x: Math.random() * (W - 80) + 40,
+      y: H - 20 - Math.random() * 30,
+      h: 25 + Math.random() * 50,
+      branches: 2 + Math.floor(Math.random() * 4),
+      color: coralColors[Math.floor(Math.random() * coralColors.length)],
+      type: Math.floor(Math.random() * 3), // 0=branching, 1=fan, 2=tube
+      phase: Math.random() * Math.PI * 2,
+    });
+  }
+  // Rochers
+  for (let i = 0; i < 8; i++) {
+    const pts = [];
+    const n = 6 + Math.floor(Math.random() * 4);
+    const r = 18 + Math.random() * 35;
+    for (let j = 0; j < n; j++) {
+      const a = (j/n) * Math.PI * 2;
+      const rr = r * (0.7 + Math.random() * 0.6);
+      pts.push([Math.cos(a)*rr, Math.sin(a)*rr*0.55]);
+    }
+    ROCKS.push({ x: Math.random()*(W-60)+30, y: H - 12 - Math.random()*25, pts, dark: Math.random() > 0.5 });
+  }
+  // Ondulations sable
+  for (let i = 0; i < 20; i++) {
+    SAND_RIPPLES.push({ x: Math.random()*W, w: 30+Math.random()*60, phase: Math.random()*Math.PI*2 });
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Bulles
+// ══════════════════════════════════════════════════════════════
+const bubbles = Array.from({length: 45}, () => ({
+  x: Math.random()*W, y: Math.random()*H,
+  r: Math.random()*2.2+0.4,
+  vy: -(Math.random()*0.4+0.08),
+  vx: (Math.random()-0.5)*0.12,
+  opacity: Math.random()*0.14+0.04,
+  wobble: Math.random()*Math.PI*2,
+}));
+
+function drawBubbles() {
+  bubbles.forEach(b => {
+    b.wobble += 0.04;
+    b.y += b.vy;
+    b.x += b.vx + Math.sin(b.wobble) * 0.15;
+    if (b.y < -5) { b.y = H + 5; b.x = Math.random()*W; }
+    const sx = (b.x / W) * canvas.width;
+    const sy = (b.y / H) * canvas.height;
+    ctx.beginPath();
+    ctx.arc(sx, sy, b.r, 0, Math.PI*2);
+    ctx.strokeStyle = `rgba(120,210,255,${b.opacity})`;
+    ctx.lineWidth = 0.6;
+    ctx.stroke();
+    // reflet
+    ctx.beginPath();
+    ctx.arc(sx - b.r*0.3, sy - b.r*0.3, b.r*0.35, 0, Math.PI*2);
+    ctx.fillStyle = `rgba(200,240,255,${b.opacity * 1.5})`;
+    ctx.fill();
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Background
+// ══════════════════════════════════════════════════════════════
+function drawBackground() {
+  const cw = canvas.width, ch = canvas.height;
+  const grad = ctx.createLinearGradient(0, 0, 0, ch);
+  grad.addColorStop(0, '#010612');
+  grad.addColorStop(0.4, '#020c1e');
+  grad.addColorStop(0.82, '#03101f');
+  grad.addColorStop(1, '#010810');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, cw, ch);
+
+  // Rayons lumineux depuis la surface
+  ctx.save();
+  for (let i = 0; i < 6; i++) {
+    const baseX = (0.1 + i * 0.16) * cw;
+    const sway = Math.sin(tick*0.0025 + i * 1.3) * 0.04 * cw;
+    const x = baseX + sway;
+    const w = (12 + Math.sin(tick*0.002+i*0.7)*4) * (cw/800);
+    const gd = ctx.createLinearGradient(x, 0, x, ch*0.75);
+    gd.addColorStop(0, `rgba(30,120,200,${0.04+Math.sin(tick*0.003+i)*0.012})`);
+    gd.addColorStop(0.5, `rgba(10,60,140,0.015)`);
+    gd.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = gd;
+    ctx.beginPath();
+    ctx.moveTo(x - w, 0);
+    ctx.lineTo(x + w, 0);
+    ctx.lineTo(x + w*0.4 + sway*0.3, ch*0.75);
+    ctx.lineTo(x - w*0.4 + sway*0.3, ch*0.75);
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // Caustics (lumière réfractée)
+  ctx.save();
+  ctx.globalAlpha = 0.025;
+  for (let i = 0; i < 12; i++) {
+    const t = tick * 0.002 + i * 0.52;
+    const x = (0.5 + 0.5*Math.sin(t*1.1)) * cw;
+    const y = (0.15 + 0.1*Math.sin(t*0.9+1)) * ch;
+    const r = (20 + 12*Math.sin(t*0.7)) * (cw/800);
+    const gc = ctx.createRadialGradient(x, y, 0, x, y, r);
+    gc.addColorStop(0, '#3ab4ff');
+    gc.addColorStop(1, 'rgba(58,180,255,0)');
+    ctx.fillStyle = gc;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.restore();
+
+  // Fond sableux
+  const sandY = ch * 0.86;
+  const sandGrad = ctx.createLinearGradient(0, sandY, 0, ch);
+  sandGrad.addColorStop(0, '#0d1e10');
+  sandGrad.addColorStop(0.3, '#111a0e');
+  sandGrad.addColorStop(1, '#0a1510');
+  ctx.fillStyle = sandGrad;
+  ctx.beginPath();
+  ctx.moveTo(0, sandY);
+  for (let x2 = 0; x2 <= cw; x2 += 12) {
+    const yy = sandY + Math.sin(x2*0.018 + tick*0.001) * 3;
+    ctx.lineTo(x2, yy);
+  }
+  ctx.lineTo(cw, ch); ctx.lineTo(0, ch); ctx.closePath();
+  ctx.fill();
+
+  // Ondulations sable
+  ctx.save();
+  ctx.globalAlpha = 0.06;
+  SAND_RIPPLES.forEach(r2 => {
+    const sx = (r2.x / W) * cw;
+    const sy = sandY + 8 + Math.sin(r2.phase + tick*0.0008)*3;
+    const sw = (r2.w / W) * cw;
+    ctx.beginPath();
+    ctx.ellipse(sx, sy, sw, 2.5, 0, 0, Math.PI*2);
+    ctx.strokeStyle = '#3a6040';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  });
+  ctx.restore();
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Décor — coraux et rochers
+// ══════════════════════════════════════════════════════════════
+function drawDecor() {
+  const cw = canvas.width, ch = canvas.height;
+  const sx = cw / W, sy = ch / H;
+  const sandY = ch * 0.86;
+
+  // Rochers
+  ROCKS.forEach(rock => {
+    const rx = rock.x * sx, ry = sandY + rock.y * (sy - 1) + 10;
+    ctx.save();
+    ctx.translate(rx, ry);
+    ctx.beginPath();
+    rock.pts.forEach(([px, py], i) => i === 0 ? ctx.moveTo(px*sx, py*sy) : ctx.lineTo(px*sx, py*sy));
+    ctx.closePath();
+    ctx.fillStyle = rock.dark ? '#0d1a12' : '#122018';
+    ctx.strokeStyle = '#1a2e1e';
+    ctx.lineWidth = 1;
+    ctx.fill(); ctx.stroke();
+    // reflet
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = '#2a4a30';
+    ctx.fill();
+    ctx.restore();
+  });
+
+  // Coraux
+  CORALS.forEach(coral => {
+    const cx2 = coral.x * sx;
+    const baseY = sandY + 4;
+    const sway = Math.sin(tick * 0.008 + coral.phase) * 2.5;
+    ctx.save();
+    ctx.translate(cx2, baseY);
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = coral.color + '55';
+
+    if (coral.type === 0) {
+      // Corail branching
+      drawCoralBranch(ctx, 0, 0, -Math.PI/2, coral.h * sy * 0.8, coral.branches, coral.color, sway, 0);
+    } else if (coral.type === 1) {
+      // Éventail
+      const fw = coral.h * sx * 0.5;
+      const fh = coral.h * sy * 0.7;
+      for (let i = 0; i <= 8; i++) {
+        const t2 = i / 8;
+        const x2 = (t2 - 0.5) * fw;
+        const sway2 = sway * (1 - t2*0.3);
+        ctx.beginPath();
+        ctx.moveTo(sway2*0.2, 0);
+        ctx.quadraticCurveTo(x2*0.4 + sway2*0.6, -fh*0.5, x2 + sway2, -fh);
+        ctx.strokeStyle = coral.color + 'aa';
+        ctx.lineWidth = 1 + (1-Math.abs(t2-0.5)*2)*1.5;
+        ctx.stroke();
+      }
+    } else {
+      // Tubes
+      for (let b = 0; b < coral.branches + 1; b++) {
+        const bx = (b - coral.branches/2) * 10 * sx;
+        const bh = (coral.h * 0.5 + b * 8) * sy * 0.7;
+        const bs = sway * (0.5 + b*0.1);
+        ctx.beginPath();
+        ctx.moveTo(bx, 0);
+        ctx.lineTo(bx + bs, -bh);
+        ctx.strokeStyle = coral.color + 'cc';
+        ctx.lineWidth = 4 * sx;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+        // ouverture
+        ctx.beginPath();
+        ctx.arc(bx + bs, -bh, 4 * sx, 0, Math.PI*2);
+        ctx.fillStyle = coral.color;
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  });
+}
+
+function drawCoralBranch(c, x, y, angle, length, depth, color, sway, lvl) {
+  if (depth <= 0 || length < 3) return;
+  const swyf = sway * (lvl * 0.3 + 0.2);
+  const ex = x + Math.cos(angle + swyf*0.04) * length;
+  const ey = y + Math.sin(angle + swyf*0.04) * length;
+  c.beginPath();
+  c.moveTo(x, y);
+  c.quadraticCurveTo(
+    x + Math.cos(angle)*length*0.5 + swyf*0.5, y + Math.sin(angle)*length*0.5,
+    ex, ey
+  );
+  c.strokeStyle = color + (lvl === 0 ? 'cc' : '99');
+  c.lineWidth = Math.max(0.8, (depth - lvl) * 1.2);
+  c.lineCap = 'round';
+  c.stroke();
+  // points aux extrémités
+  if (depth === 1) {
+    c.beginPath();
+    c.arc(ex, ey, 2.5, 0, Math.PI*2);
+    c.fillStyle = color;
+    c.fill();
+  }
+  if (depth > 0) {
+    drawCoralBranch(c, ex, ey, angle - 0.45, length*0.65, depth-1, color, sway, lvl+1);
+    drawCoralBranch(c, ex, ey, angle + 0.45, length*0.65, depth-1, color, sway, lvl+1);
+    if (depth > 1 && Math.random() < 0.5)
+      drawCoralBranch(c, ex, ey, angle, length*0.55, depth-1, color, sway, lvl+1);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Nourriture (organique)
+// ══════════════════════════════════════════════════════════════
+function drawFood() {
+  foods.forEach(f => {
+    if (f.eaten) return;
+    f.phase += 0.05;
+    const sx = (f.x / W) * canvas.width;
+    const sy = (f.y / H) * canvas.height;
+    const s = f.size;
+
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    if (f.type === 0) {
+      // Granulé
+      const pulse = 0.88 + Math.sin(f.phase) * 0.12;
+      ctx.beginPath();
+      ctx.arc(0, 0, 4.5 * s * pulse, 0, Math.PI*2);
+      ctx.fillStyle = '#39ff8a';
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = '#39ff8a';
+      ctx.fill();
+      ctx.globalAlpha = 0.4;
+      ctx.beginPath();
+      ctx.arc(-1, -1.2, 1.5*s, 0, Math.PI*2);
+      ctx.fillStyle = '#afffcc';
+      ctx.fill();
+    } else if (f.type === 1) {
+      // Algue flottante
+      ctx.strokeStyle = '#2ecc71';
+      ctx.lineWidth = 1.5;
+      ctx.shadowBlur = 6;
+      ctx.shadowColor = '#2ecc71';
+      ctx.globalAlpha = 0.85;
+      const h2 = 12 * s;
+      ctx.beginPath();
+      ctx.moveTo(0, h2/2);
+      for (let i = 0; i <= 6; i++) {
+        const t2 = i / 6;
+        const wx = Math.sin(t2*Math.PI*2 + f.phase) * 3 * s;
+        ctx.lineTo(wx, h2/2 - t2*h2);
+      }
+      ctx.stroke();
+    } else {
+      // Plancton — petits points
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = '#00ffd4';
+      for (let i = 0; i < 4; i++) {
+        const a = (i/4)*Math.PI*2 + f.phase*0.5;
+        const r2 = 4 * s;
+        const pulse = 0.8 + Math.sin(f.phase + i*1.2) * 0.2;
+        ctx.beginPath();
+        ctx.arc(Math.cos(a)*r2, Math.sin(a)*r2, 1.8*pulse, 0, Math.PI*2);
+        ctx.fillStyle = '#00ffd4';
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Prédateur (requin)
+// ══════════════════════════════════════════════════════════════
+function drawPredators() {
+  const scaleX = canvas.width / W, scaleY = canvas.height / H;
+  preds.forEach(pred => {
+    const sx = pred.x * scaleX;
+    const sy = pred.y * scaleY;
+    const isActive = pred.active;
+    const tailSway = Math.sin(pred.tailPhase) * (isActive ? 0.4 : 0.18);
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(pred.angle);
+
+    const alpha = isActive ? 0.95 : 0.45;
+    ctx.globalAlpha = alpha;
+
+    const L = isActive ? 32 : 26; // longueur corps
+
+    if (isActive) {
+      ctx.shadowBlur = 22;
+      ctx.shadowColor = 'rgba(180,0,0,0.5)';
+    }
+
+    // Queue (animée)
+    ctx.save();
+    ctx.rotate(tailSway);
+    ctx.beginPath();
+    ctx.moveTo(-L*0.55, 0);
+    ctx.lineTo(-L, -L*0.38);
+    ctx.lineTo(-L*0.95, 0);
+    ctx.lineTo(-L, L*0.38);
+    ctx.closePath();
+    ctx.fillStyle = isActive ? '#991111' : '#4a2020';
+    ctx.fill();
+    ctx.restore();
+
+    // Corps principal
+    ctx.beginPath();
+    ctx.moveTo(L, 0); // museau
+    ctx.bezierCurveTo(L*0.6, -L*0.22, -L*0.2, -L*0.25, -L*0.55, -L*0.04);
+    ctx.bezierCurveTo(-L*0.6, -L*0.02, -L*0.6, L*0.02, -L*0.55, L*0.04);
+    ctx.bezierCurveTo(-L*0.2, L*0.25, L*0.6, L*0.22, L, 0);
+    ctx.fillStyle = isActive ? '#b01515' : '#3d1818';
+    ctx.fill();
+
+    // Ventre
+    ctx.beginPath();
+    ctx.moveTo(L*0.7, 0);
+    ctx.bezierCurveTo(L*0.4, -L*0.1, -L*0.1, -L*0.1, -L*0.3, -L*0.02);
+    ctx.bezierCurveTo(-L*0.3, L*0.02, -L*0.1, L*0.1, L*0.4, L*0.1);
+    ctx.closePath();
+    ctx.fillStyle = isActive ? '#cc2a2a55' : '#3d181855';
+    ctx.fill();
+
+    // Nageoire dorsale
+    ctx.beginPath();
+    ctx.moveTo(L*0.05, -L*0.2);
+    ctx.lineTo(L*0.25, -L*0.5);
+    ctx.lineTo(L*0.4, -L*0.22);
+    ctx.closePath();
+    ctx.fillStyle = isActive ? '#991111' : '#3d1818';
+    ctx.fill();
+
+    // Nageoires pectorales
+    ctx.beginPath();
+    ctx.moveTo(L*0.2, L*0.15);
+    ctx.lineTo(L*0.05, L*0.42);
+    ctx.lineTo(-L*0.12, L*0.18);
+    ctx.closePath();
+    ctx.fillStyle = isActive ? '#aa1818' : '#3a1515';
+    ctx.fill();
+
+    // Oeil
+    ctx.shadowBlur = 0;
+    ctx.beginPath();
+    ctx.arc(L*0.55, -L*0.07, L*0.07, 0, Math.PI*2);
+    ctx.fillStyle = '#0a0a0a';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(L*0.55, -L*0.07, L*0.03, 0, Math.PI*2);
+    ctx.fillStyle = isActive ? '#ff2020' : '#333';
+    ctx.fill();
+
+    // Dents (si actif)
+    if (isActive) {
+      ctx.globalAlpha = 0.7;
+      for (let t = 0; t < 3; t++) {
+        const tx = L*0.88 - t*L*0.1;
+        const tw = L*0.045;
+        ctx.beginPath();
+        ctx.moveTo(tx, -L*0.03);
+        ctx.lineTo(tx - tw, -L*0.1);
+        ctx.lineTo(tx - tw*2, -L*0.03);
+        ctx.fillStyle = '#f0f0f0';
+        ctx.fill();
+      }
+    }
+
+    ctx.restore();
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Poisson (réaliste avec nageoires et queue animées)
+// ══════════════════════════════════════════════════════════════
+function drawFish(fish, scaleX, scaleY) {
+  const sx = fish.x * scaleX;
+  const sy = fish.y * scaleY;
+
+  // Trail
+  if (fish.alive && fish.trail.length > 3) {
+    ctx.save();
+    ctx.globalAlpha = 0.0;
+    for (let i = 1; i < fish.trail.length; i++) {
+      const t = i / fish.trail.length;
+      const tx1 = fish.trail[i-1].x * scaleX, ty1 = fish.trail[i-1].y * scaleY;
+      const tx2 = fish.trail[i].x * scaleX, ty2 = fish.trail[i].y * scaleY;
+      ctx.beginPath();
+      ctx.moveTo(tx1, ty1);
+      ctx.lineTo(tx2, ty2);
+      ctx.strokeStyle = fish.color;
+      ctx.globalAlpha = t * 0.07 * (fish.fear > 0.3 ? 1.5 : 1);
+      ctx.lineWidth = t * 2.5;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  ctx.save();
+  ctx.translate(sx, sy);
+  ctx.rotate(fish.angle);
+
+  const alive = fish.alive;
+  ctx.globalAlpha = alive ? 1 : 0.18;
+
+  const L = 11; // demi-longueur corps
+  const tailSway = alive ? Math.sin(fish.tailPhase) * fish.tailAmp * 0.8 : 0;
+  const fearGlow = fish.fear > 0.4;
+
+  if (alive) {
+    ctx.shadowBlur = fearGlow ? 18 : 9;
+    ctx.shadowColor = fearGlow ? '#ff4444' : fish.color;
+  }
+
+  // Queue
+  ctx.save();
+  ctx.translate(-L*1.1, 0);
+  ctx.rotate(tailSway * 0.7);
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(-L*0.75, -L*0.7);
+  ctx.lineTo(-L*0.4, 0);
+  ctx.lineTo(-L*0.75, L*0.7);
+  ctx.closePath();
+  ctx.fillStyle = fish.color + 'cc';
+  ctx.fill();
+  ctx.restore();
+
+  // Corps
+  ctx.beginPath();
+  ctx.moveTo(L*1.2, 0);
+  ctx.bezierCurveTo(L*0.8, -L*0.62, -L*0.5, -L*0.7, -L*1.1, 0);
+  ctx.bezierCurveTo(-L*0.5, L*0.7, L*0.8, L*0.62, L*1.2, 0);
+  ctx.fillStyle = fish.color;
+  ctx.fill();
+
+  // Ventre (reflet)
+  ctx.beginPath();
+  ctx.moveTo(L*0.9, 0);
+  ctx.bezierCurveTo(L*0.5, -L*0.28, -L*0.2, -L*0.3, -L*0.7, 0);
+  ctx.bezierCurveTo(-L*0.2, L*0.3, L*0.5, L*0.28, L*0.9, 0);
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.fill();
+
+  // Nageoire dorsale
+  ctx.beginPath();
+  ctx.moveTo(-L*0.3, -L*0.5);
+  ctx.quadraticCurveTo(L*0.1, -L*1.0, L*0.5, -L*0.52);
+  ctx.lineTo(L*0.5, -L*0.38);
+  ctx.quadraticCurveTo(L*0.1, -L*0.7, -L*0.3, -L*0.38);
+  ctx.closePath();
+  ctx.globalAlpha = alive ? 0.7 : 0.15;
+  ctx.fillStyle = fish.color + 'aa';
+  ctx.fill();
+  ctx.globalAlpha = alive ? 1 : 0.18;
+
+  // Nageoire anale (ventrale)
+  ctx.beginPath();
+  ctx.moveTo(-L*0.1, L*0.42);
+  ctx.quadraticCurveTo(L*0.15, L*0.85, L*0.45, L*0.45);
+  ctx.lineTo(L*0.45, L*0.35);
+  ctx.quadraticCurveTo(L*0.15, L*0.6, -L*0.1, L*0.32);
+  ctx.closePath();
+  ctx.globalAlpha = alive ? 0.55 : 0.1;
+  ctx.fillStyle = fish.color + '88';
+  ctx.fill();
+  ctx.globalAlpha = alive ? 1 : 0.18;
+
+  // Nageoires pectorales
+  ctx.shadowBlur = 0;
+  ctx.beginPath();
+  ctx.moveTo(L*0.4, L*0.18);
+  ctx.quadraticCurveTo(L*0.7, L*0.55, L*0.1, L*0.5);
+  ctx.closePath();
+  ctx.globalAlpha = alive ? 0.5 : 0.1;
+  ctx.fillStyle = fish.color + '77';
+  ctx.fill();
+  ctx.globalAlpha = alive ? 1 : 0.18;
+
+  // Œil
+  ctx.shadowBlur = 0;
+  ctx.beginPath();
+  ctx.arc(L*0.55, -L*0.15, L*0.22, 0, Math.PI*2);
+  ctx.fillStyle = '#0d1a0d';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(L*0.55, -L*0.15, L*0.14, 0, Math.PI*2);
+  ctx.fillStyle = alive ? '#ffffff' : '#333';
+  ctx.globalAlpha = alive ? 0.9 : 0.3;
+  ctx.fill();
+  ctx.globalAlpha = alive ? 1 : 0.18;
+  ctx.beginPath();
+  ctx.arc(L*0.6, -L*0.18, L*0.06, 0, Math.PI*2);
+  ctx.fillStyle = '#0a0a0a';
+  ctx.fill();
+
+  // Écailles (légères lignes)
+  if (alive) {
+    ctx.globalAlpha = 0.08;
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 0.6;
+    for (let i = 0; i < 3; i++) {
+      const ex = -L*0.2 + i*L*0.45;
+      const ew = L*0.3 - i*0.02;
+      ctx.beginPath();
+      ctx.arc(ex, 0, ew, -Math.PI*0.5, Math.PI*0.5);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // Barre de peur
+  if (alive && fish.fear > 0.2) {
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = fish.fear * 0.75;
+    const bw = L * 2.4;
+    ctx.fillStyle = '#ff2a2a';
+    ctx.fillRect(-bw/2, -L*1.4, bw * fish.fear, 2.5);
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(-bw/2, -L*1.4, bw, 2.5);
+  }
+
+  ctx.restore();
+
+  // Label hover
+  if (hoveredFish === fish) {
+    ctx.save();
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = fish.color;
+    ctx.font = '10px JetBrains Mono, monospace';
+    ctx.fillText(fish.name, sx + 14, sy - 14);
+    ctx.restore();
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Scene
+// ══════════════════════════════════════════════════════════════
+function drawScene() {
+  resizeCanvas();
+  const cw = canvas.width, ch = canvas.height;
+  const sx = cw / W, sy = ch / H;
+
+  drawBackground();
+  drawDecor();
+
+  ctx.save();
+  drawBubbles();
+  ctx.restore();
+
+  drawFood();
+  drawPredators();
+  fishes.forEach(f => drawFish(f, sx, sy));
+}
+
+// ══════════════════════════════════════════════════════════════
+//  UI / Stats
+// ══════════════════════════════════════════════════════════════
+function buildLineageCards() {
+  if (!lineageData) return;
+  const container = document.getElementById('lineageCards');
+  container.innerHTML = '';
+
+  Object.values(lineageData.lineages).forEach(lin => {
+    const card = document.createElement('div');
+    card.className = 'lineage-card';
+    card.id = 'card-' + lin.name;
+    card.style.setProperty('--lcolor', lin.color);
+
+    const tags = behaviourLabel(lin);
+    const tagHTML = tags.map(t =>
+      `<span class="behav-tag" style="color:${t.color};border-color:${t.color}33">${t.text}</span>`
+    ).join(' ');
+
+    card.innerHTML = `
+      <div class="lineage-header">
+        <span class="lineage-name">${lin.name}</span>
+        <span class="lineage-status" id="status-${lin.name}">vivant</span>
+      </div>
+      <div class="stat-row"><span>fitness évol.</span><span class="stat-val">${lin.final_fitness.toFixed(3)}</span></div>
+      <div class="stat-row"><span>nourriture</span><span class="stat-val" id="food-${lin.name}">0</span></div>
+      <div class="stat-row"><span>survie</span><span class="stat-val" id="steps-${lin.name}">0 ticks</span></div>
+      <div class="stat-row"><span>peur</span><span class="stat-val" id="fear-${lin.name}">0%</span></div>
+      ${tagHTML}
+      <div class="mini-chart">
+        <canvas class="sparkline" id="spark-${lin.name}" height="26"></canvas>
+      </div>
+    `;
+    container.appendChild(card);
+    requestAnimationFrame(() => drawSparkline(lin));
+  });
+}
+
+function drawSparkline(lin) {
+  const cvs = document.getElementById('spark-' + lin.name);
+  if (!cvs) return;
+  cvs.width = cvs.offsetWidth; cvs.height = 26;
+  const c = cvs.getContext('2d');
+  const data = lin.history.map(h => h.best);
+  const mx = Math.max(...data, 0.01);
+  const cw = cvs.width, ch = cvs.height;
+
+  c.clearRect(0,0,cw,ch);
+
+  // Aire sous la courbe
+  const grad = c.createLinearGradient(0, 0, 0, ch);
+  grad.addColorStop(0, lin.color + '33');
+  grad.addColorStop(1, 'transparent');
+  c.fillStyle = grad;
+  c.beginPath();
+  data.forEach((v, i) => {
+    const x = (i / (data.length-1)) * cw;
+    const y = ch - (v/mx) * ch * 0.88 - 2;
+    i === 0 ? c.moveTo(x, ch) : undefined;
+    i === 0 ? c.lineTo(x, y) : c.lineTo(x, y);
+  });
+  c.lineTo(cw, ch); c.closePath(); c.fill();
+
+  // Ligne
+  c.strokeStyle = lin.color;
+  c.lineWidth = 1.5;
+  c.shadowBlur = 5;
+  c.shadowColor = lin.color;
+  c.globalAlpha = 0.85;
+  c.beginPath();
+  data.forEach((v, i) => {
+    const x = (i / (data.length-1)) * cw;
+    const y = ch - (v/mx) * ch * 0.88 - 2;
+    i === 0 ? c.moveTo(x,y) : c.lineTo(x,y);
+  });
+  c.stroke();
+}
+
+function updateUI() {
+  const alive = fishes.filter(f => f.alive).length;
+  document.getElementById('gTick').textContent = tick;
+  document.getElementById('gAlive').textContent = `${alive} / ${fishes.length}`;
+  document.getElementById('gFood').textContent = foods.filter(f=>!f.eaten).length;
+
+  fishes.forEach(fish => {
+    const s  = document.getElementById('status-' + fish.name);
+    const fE = document.getElementById('food-' + fish.name);
+    const st = document.getElementById('steps-' + fish.name);
+    const fe = document.getElementById('fear-' + fish.name);
+    if (s) { s.textContent = fish.alive ? '● vivant' : '✕ mort'; s.style.color = fish.alive ? '#2ecc71' : '#555'; }
+    if (fE) fE.textContent = fish.foodEaten;
+    if (st) st.textContent = fish.stepsSurvived + ' ticks';
+    if (fe) fe.textContent = Math.round(fish.fear * 100) + '%';
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Mouse
+// ══════════════════════════════════════════════════════════════
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) / canvas.width * W;
+  const my = (e.clientY - rect.top) / canvas.height * H;
+
+  hoveredFish = null;
+  fishes.forEach(fish => {
+    if (fish.alive && dist(mx,my,fish.x,fish.y) < 20) hoveredFish = fish;
+  });
+
+  if (hoveredFish) {
+    tooltip.style.display = 'block';
+    tooltip.style.left = (e.clientX - rect.left + 16) + 'px';
+    tooltip.style.top  = (e.clientY - rect.top  + 16) + 'px';
+    const f = hoveredFish;
+    const foodDesc = { rich:'abondante', normal:'normale', sparse:'rare' };
+    tooltip.innerHTML = `
+      <b style="color:${f.color}">${f.name}</b><br>
+      aggro prédateur : ${f.context.predator_aggro}<br>
+      nourriture : ${foodDesc[f.context.food_density] || '—'}<br>
+      fitness évol : ${f.finalFitness.toFixed(3)}<br>
+      peur : ${Math.round(f.fear*100)}%
+    `;
+  } else {
+    tooltip.style.display = 'none';
+  }
+});
+canvas.addEventListener('mouseleave', () => { tooltip.style.display='none'; hoveredFish=null; });
+
+// ══════════════════════════════════════════════════════════════
+//  Contrôles
+// ══════════════════════════════════════════════════════════════
+function setSpeed(s) {
+  speed = s;
+  ['btn1x','btn3x','btn10x'].forEach(id => document.getElementById(id).classList.remove('active'));
+  document.getElementById(`btn${s}x`).classList.add('active');
+}
+function togglePause() {
+  paused = !paused;
+  document.getElementById('btnPause').textContent = paused ? '▶ play' : '⏸ pause';
+}
+function resetSim() { generateDecor(); spawnWorld(); }
+
+// ══════════════════════════════════════════════════════════════
+//  Boucle principale
+// ══════════════════════════════════════════════════════════════
+let lastUI = 0;
+function loop(ts) {
+  if (!paused) {
+    for (let i = 0; i < speed; i++) simStep();
+  }
+  drawScene();
+  if (ts - lastUI > 120) { updateUI(); lastUI = ts; }
+  requestAnimationFrame(loop);
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Init
+// ══════════════════════════════════════════════════════════════
+async function init() {
+  generateDecor();
+  try {
+    const res = await fetch('lineages.json');
+    lineageData = await res.json();
+    buildLineageCards();
+    spawnWorld();
+    requestAnimationFrame(loop);
+  } catch(e) {
+    document.body.innerHTML += `
+      <div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+        background:#020810;border:1px solid #e74c3c;padding:24px;color:#e74c3c;font-family:monospace;border-radius:4px">
+        ⚠ lineages.json introuvable.<br><br>
+        Lance d'abord :<br>
+        <code style="color:#aaa">python evolution.py</code>
+      </div>`;
+  }
+}
+
+init();
+</script>
+</body>
+</html>
