@@ -76,7 +76,7 @@ from multiprocessing import Pool, cpu_count
 WORLD_W, WORLD_H = 800, 600
 N_FOOD_BASE      = 22
 MAX_STEPS        = 2500
-N_GENERATIONS    = 34
+N_GENERATIONS    = 80
 POP_SIZE         = 28
 ELITE_K          = 6
 N_SEEDS          = 5
