@@ -1,40 +1,68 @@
 """
-Aquarium Evolution Engine v4
+Aquarium Evolution Engine v5
 ==============================
-Améliorations vs v3 :
+Corrections vs v4 (qui causaient les poissons bloqués aux bords,
+prédateurs incohérents, nourriture qui se superpose) :
 
-ALGORITHME
-----------
-1. Punition bord renforcée : -0.25 par tick passé dans une zone de 60px des murs
-   → le réseau apprend activement à éviter les coins, pas juste à ne pas les toucher
-2. Fitness faim intégrée : mourir de faim = ×0.3 sur la fitness totale
-   (vs ×0.5 v3 — pression plus forte)
-3. Bonus exploration : récompense légère si le poisson couvre bien le monde
-   (distance parcourue / zone accessible) → évite les stratégies "je reste immobile"
-4. N_SEEDS=4 (vs 3) + seeds espacées de 1997 (moins de corrélation entre envs)
-5. Évaluation parallèle avec multiprocessing.Pool (×4 sur CPU 4-core)
+PHYSIQUE / MURS
+---------------
+1. Répulsion de mur RADICALEMENT adoucie : force 5.5→2.6, exposant
+   2.2→1.6, et surtout le signal de répulsion est maintenant CLAMPÉ
+   et mélangé (pas juste additionné brut) pour ne plus écraser
+   complètement la décision du réseau près des coins. Avant, dans un
+   coin, ax et ay pouvaient atteindre ±5.5 chacun (>> FISH_SPD=3.0),
+   noyant toute intention du réseau → le poisson restait "collé"
+   en oscillant.
+2. Pénalité de bord dans la fitness FORTEMENT augmentée et
+   exponentielle avec la proximité réelle (pas juste un ratio de
+   ticks) → pression sélective beaucoup plus nette pour quitter
+   les bords.
+3. Mirroir EXACT JS/Python de wall_repulse (même force, même zone,
+   même exposant).
 
 PRÉDATEUR
 ---------
-6. 3 modes comportementaux distincts :
-   - RÔDE   : dérive vers centroïde des proies, vitesse 30% de sa vitesse max
-   - EMBUSCADE : s'immobilise 60-120 ticks près d'un couloir, attend
-   - CHASSE  : interception prédictive (horizon adaptatif)
-   Transitions : distance → chasse, timeout → embuscade → rôde
-7. Vitesse adaptée à aggro du contexte (déjà présent mais corrigé)
-8. Prédateur peut "abandonner" une proie et en choisir une nouvelle
-   si une autre poisson plus proche passe dans son champ
+4. La vitesse du prédateur dans la visualisation suit maintenant
+   `pred_aggro` de la lignée du poisson actuellement pourchassé
+   (mirroir fidèle de l'entraînement, où chaque lignée affronte un
+   prédateur à SA vitesse d'agressivité).
+5. Le prédateur peut maintenant cibler n'importe quel poisson vivant
+   (pas seulement "le plus proche au moment du spawn") et change de
+   cible si une proie plus proche apparaît à <0.6×distance actuelle
+   (mirroir de la règle "abandon de cible").
 
-POISSON (inputs réseau)
------------------------
-9. Input 12 : danger_memory [0,1] — souvenir d'où était le prédateur récemment
-   → le poisson peut apprendre à fuir les zones dangereuses même sans prédateur visible
-   (INPUT_SIZE passe de 12 à 13)
-10. Input 13 : hunger_urgency [0,1] — 1.0 quand proche de la mort de faim
-    → signal explicite que la nourriture devient vitale
-    (INPUT_SIZE = 14)
-11. Répulsion mur prise en compte dans la fitness : chaque tick à <60px d'un bord
-    ajoute une pénalité (évite que le réseau apprenne à longer les bords)
+NOURRITURE
+----------
+6. Pool de nourriture PROPRE À CHAQUE LIGNÉE, dimensionné selon son
+   contexte d'entraînement (rich=32, normal=22, sparse=10) — un
+   poisson "Vert" (sparse) ne voit que SES 10 nourritures, comme à
+   l'entraînement. Évite la superposition visuelle générale et rend
+   le comportement cohérent avec ce que le réseau a appris.
+7. Anti-superposition : toute nouvelle position de nourriture
+   (spawn ou recyclage) est tirée jusqu'à respecter une distance
+   minimale (28px) avec les autres nourritures de SON pool.
+
+RÉSEAU (inputs 15, INPUT_SIZE 14→15)
+-------------------------------------
+8. Nouvel input 14 : "time_since_meal" — temps écoulé (normalisé,
+   sature à 1.0 après ~400 ticks) depuis le dernier repas. Permet au
+   réseau d'apprendre une vraie dynamique de "pression de faim qui
+   redescend quand on mange régulièrement" — signal complémentaire
+   de hunger_urgency (qui ne réagit qu'en fin de réserve). Avec ce
+   signal, on peut observer le réseau apprendre à anticiper la faim
+   plutôt que d'y réagir trop tard.
+
+FITNESS / PRESSION DE SURVIE
+-----------------------------
+9. Mourir de faim sans avoir JAMAIS mangé : pénalité encore plus
+   sévère (×0.05 au lieu de ×0.10) — "ne pas comprendre qu'il faut
+   manger" est désormais quasi-fatal pour le score.
+10. Bonus de régularité alimentaire : récompense additionnelle basée
+    sur le temps moyen entre deux repas (favorise une stratégie de
+    nutrition régulière plutôt que famine puis festin).
+11. ENTRAÎNEMENT PLUS POUSSÉ : N_GENERATIONS 22→34, POP_SIZE 24→28,
+    N_SEEDS 4→5 — convergence plus robuste, comportements de survie
+    plus nets observables à la fin.
 
 OUTPUT : identique (4 sorties différentielles)
 """
@@ -48,26 +76,27 @@ from multiprocessing import Pool, cpu_count
 WORLD_W, WORLD_H = 800, 600
 N_FOOD_BASE      = 22
 MAX_STEPS        = 2500
-N_GENERATIONS    = 22
-POP_SIZE         = 24
-ELITE_K          = 5
-N_SEEDS          = 4
+N_GENERATIONS    = 34
+POP_SIZE         = 28
+ELITE_K          = 6
+N_SEEDS          = 5
 MUT_INIT         = 0.13
 MUT_MIN          = 0.025
 MUT_MAX          = 0.32
 STAG_WINDOW      = 4
 
 # ── Réseau (MIROIR EXACT DANS LE HTML) ────────────────────────────────────────
-# Inputs (14) :
+# Inputs (15) :
 #  0-2  : nourriture  (dx/W, dy/H, dist_norm)
 #  3-5  : prédateur   (dx/W, dy/H, dist_norm)
 #  6-7  : murs        (dist_x_norm, dist_y_norm)
 #  8-9  : vélocité    (vx/MAX_SPD, vy/MAX_SPD)
 #  10   : peur        [0,1]
 #  11   : pred_active [0,1]
-#  12   : danger_memory [0,1]  ← NOUVEAU
-#  13   : hunger_urgency [0,1] ← NOUVEAU
-INPUT_SIZE  = 14
+#  12   : danger_memory [0,1]
+#  13   : hunger_urgency [0,1]
+#  14   : time_since_meal [0,1]  ← NOUVEAU
+INPUT_SIZE  = 15
 HIDDEN_SIZE = 18
 OUTPUT_SIZE = 4
 MAX_SPD     = 3.2
@@ -76,7 +105,10 @@ PANIC_DIST  = 100
 
 HUNGER_DEC   = 1.0 / (MAX_STEPS * 0.75)   # meurt si 0 nourriture sur 75% de la durée
 HUNGER_GAIN  = 0.40
-BORDER_ZONE  = 60   # pixels : pénalité si poisson trop près d'un bord
+BORDER_ZONE  = 80    # pixels : zone de répulsion / pénalité bord
+WALL_FORCE   = 2.6   # force de répulsion (mirroir exact JS)
+WALL_EXP     = 1.6   # exposant de répulsion (mirroir exact JS)
+MEAL_SAT_TICKS = 400.0  # ticks pour saturer time_since_meal à 1.0
 
 LINEAGE_CONTEXTS = {
     "Rouge":  {"pred_aggro": 2.6, "food": "normal", "color": "#e74c3c",
@@ -262,6 +294,18 @@ class Pred:
         self.y = float(np.clip(self.y + self.vy, 5, WORLD_H-5))
 
 
+# ── Répulsion de mur (MIROIR EXACT JS) ─────────────────────────────────────────
+
+def wall_repulse(pos, lo, hi, force=WALL_FORCE, zone=BORDER_ZONE, exp=WALL_EXP):
+    dist_lo = pos - lo; dist_hi = hi - pos
+    rep = 0.0
+    if dist_lo < zone:
+        rep += force * (1.0 - dist_lo/zone) ** exp
+    if dist_hi < zone:
+        rep -= force * (1.0 - dist_hi/zone) ** exp
+    return rep
+
+
 # ── Simulation ────────────────────────────────────────────────────────────────
 
 def run_sim(brain, ctx, seed):
@@ -282,9 +326,11 @@ def run_sim(brain, ctx, seed):
     danger_memory = 0.0   # souvenir de la dernière position du prédateur
     food_eaten    = 0
     dist_tot      = 0.0
-    border_ticks  = 0     # ticks passés trop près d'un bord
+    border_pen    = 0.0   # pénalité bord cumulée (exponentielle)
     hunger        = 1.0
     died_starvation = False
+    ticks_since_meal = MEAL_SAT_TICKS  # commence "affamé depuis longtemps"
+    meal_intervals = []   # historique des écarts entre repas (régularité)
 
     for step in range(MAX_STEPS):
         # ── Faim ──────────────────────────────────────────────────────────────
@@ -292,6 +338,8 @@ def run_sim(brain, ctx, seed):
         if hunger <= 0.0:
             died_starvation = True
             break
+
+        ticks_since_meal = min(MEAL_SAT_TICKS, ticks_since_meal + 1)
 
         # ── Timer prédateur ───────────────────────────────────────────────────
         if pred_active:
@@ -338,10 +386,10 @@ def run_sim(brain, ctx, seed):
         wx = min(fx, WORLD_W-fx) / (WORLD_W*.5)
         wy = min(fy, WORLD_H-fy) / (WORLD_H*.5)
 
-        near_border = (fx < BORDER_ZONE or fx > WORLD_W-BORDER_ZONE or
-                       fy < BORDER_ZONE or fy > WORLD_H-BORDER_ZONE)
-        if near_border:
-            border_ticks += 1
+        # Pénalité bord : exponentielle avec la proximité réelle (pas binaire)
+        bx = max(0.0, 1.0 - min(fx, WORLD_W-fx)/BORDER_ZONE)
+        by = max(0.0, 1.0 - min(fy, WORLD_H-fy)/BORDER_ZONE)
+        border_pen += max(bx, by) ** 2
 
         # ── Danger memory (décroît exponentiellement) ─────────────────────────
         if pred_active and pd_dn < 250:
@@ -351,6 +399,7 @@ def run_sim(brain, ctx, seed):
 
         # ── Urgence faim ──────────────────────────────────────────────────────
         hunger_urgency = max(0.0, 1.0 - hunger * 2.5)   # monte fort sous 0.4
+        meal_signal    = ticks_since_meal / MEAL_SAT_TICKS  # 0=vient de manger, 1=longtemps
 
         inp = np.array([
             fd_dx, fd_dy, fd_d,
@@ -361,22 +410,14 @@ def run_sim(brain, ctx, seed):
             float(pred_active),
             danger_memory,
             hunger_urgency,
+            meal_signal,
         ], dtype=np.float32)
 
         out = brain.forward(inp)
         ax  = (out[3] - out[2]) * FISH_SPD
         ay  = (out[0] - out[1]) * FISH_SPD
 
-        # ── Répulsion mur (exponentielle) ─────────────────────────────────────
-        def wall_repulse(pos, lo, hi, force=5.0, zone=80):
-            dist_lo = pos - lo; dist_hi = hi - pos
-            rep = 0.0
-            if dist_lo < zone:
-                rep += force * (1.0 - dist_lo/zone)**2
-            if dist_hi < zone:
-                rep -= force * (1.0 - dist_hi/zone)**2
-            return rep
-
+        # ── Répulsion mur (adoucie, mirroir exact JS) ─────────────────────────
         ax += wall_repulse(fx, 5, WORLD_W-5)
         ay += wall_repulse(fy, 5, WORLD_H-5)
 
@@ -401,19 +442,31 @@ def run_sim(brain, ctx, seed):
             if not f[2] and np.sqrt((fx-f[0])**2+(fy-f[1])**2) < 14:
                 f[2] = True; food_eaten += 1
                 hunger = min(1.0, hunger + HUNGER_GAIN)
-                f[0] = float(rng.uniform(20, WORLD_W-20))
-                f[1] = float(rng.uniform(20, WORLD_H-20))
-                f[2] = False
+                meal_intervals.append(ticks_since_meal)
+                ticks_since_meal = 0.0
+                # Respawn anti-superposition (distance min avec autres nourritures)
+                for _try in range(8):
+                    nx = float(rng.uniform(20, WORLD_W-20))
+                    ny = float(rng.uniform(20, WORLD_H-20))
+                    ok = True
+                    for g in foods:
+                        if g is f or g[2]:
+                            continue
+                        if np.sqrt((nx-g[0])**2+(ny-g[1])**2) < 28:
+                            ok = False; break
+                    if ok:
+                        break
+                f[0] = nx; f[1] = ny; f[2] = False
 
         # ── Prédateur step + mort ─────────────────────────────────────────────
         pred.step([(fx, fy)], pred_active, rng)
         if pred_active and np.sqrt((fx-pred.x)**2+(fy-pred.y)**2) < 18:
             sr  = step / MAX_STEPS
             fr  = food_eaten / max(step, 1) * 120
-            bp  = border_ticks / max(step, 1)   # ratio de temps collé au bord
-            fit = 0.08*sr + 0.88*min(fr,1.) - 0.04*bp
+            bp  = border_pen / max(step, 1)
+            fit = 0.08*sr + 0.86*min(fr,1.) - 0.06*bp
             if food_eaten == 0:
-                fit *= 0.10
+                fit *= 0.05
             return max(fit, 0.0), food_eaten, step
 
         # ── Peur ──────────────────────────────────────────────────────────────
@@ -425,11 +478,17 @@ def run_sim(brain, ctx, seed):
     # Fin de vie (survie ou famine)
     fr   = food_eaten / MAX_STEPS * 120
     eff  = food_eaten / max(dist_tot, 1) * 600
-    bp   = border_ticks / MAX_STEPS   # ratio de temps collé au bord
-    fit  = (0.78*min(fr,1.) + 0.12*min(eff,1.) + 0.10)
-    fit -= 0.12*bp            # pénalité bord
+    bp   = border_pen / MAX_STEPS
+    # Bonus de régularité : moyenne des écarts entre repas, normalisée
+    if len(meal_intervals) >= 2:
+        avg_gap = float(np.mean(meal_intervals))
+        regularity = max(0.0, 1.0 - avg_gap / MEAL_SAT_TICKS)
+    else:
+        regularity = 0.0
+    fit  = (0.70*min(fr,1.) + 0.12*min(eff,1.) + 0.08*regularity + 0.10)
+    fit -= 0.16*bp            # pénalité bord (exponentielle, beaucoup plus stricte)
     if food_eaten == 0:
-        fit *= 0.10
+        fit *= 0.05
     if died_starvation:
         fit *= 0.30            # mort de faim : forte pénalité
     return max(fit, 0.0), food_eaten, MAX_STEPS

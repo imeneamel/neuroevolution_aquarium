@@ -1,7 +1,7 @@
 // ══════════════════════════════════════════════════════════════
 //  CONSTANTES (miroir exact du Python)
 // ══════════════════════════════════════════════════════════════
-const INPUT_SIZE  = 14;
+const INPUT_SIZE  = 15;
 const HIDDEN_SIZE = 18;
 const OUTPUT_SIZE = 4;
 const W = 800, H = 600;
@@ -12,8 +12,14 @@ const FOOD_R = 11, PRED_R = 16, FISH_R = 9;
 const HUNGER_DEC  = 1.0 / (2500 * 0.75);
 const HUNGER_GAIN = 0.40;
 const BORDER_ZONE = 80;
+const WALL_FORCE  = 2.6;   // mirroir exact Python (était 5.5 — beaucoup trop fort)
+const WALL_EXP    = 1.6;   // mirroir exact Python (était 2.2)
+const MEAL_SAT_TICKS = 400.0;
+const FOOD_MIN_DIST = 28;  // anti-superposition nourriture
 const N_FOOD_BASE = 22;
 const AGGRO_R = 230, ABANDON_R = 290, MAX_CHASE_TICKS = 220;
+// Nombre de nourritures par contexte de lignée (mirroir exact Python)
+const FOOD_COUNT_BY_CONTEXT = { rich: 32, normal: N_FOOD_BASE, sparse: 10 };
 
 // ══════════════════════════════════════════════════════════════
 //  MLP — miroir exact
@@ -96,6 +102,16 @@ function behaviourInsight(fish) {
   // Vivant — analyse du comportement en cours
   if (steps < 100) return "Neurones en phase d'exploration initiale.";
 
+  // Régularité alimentaire : le réseau a-t-il appris à anticiper la faim
+  // plutôt que d'attendre l'urgence ?
+  if (fish.mealIntervals && fish.mealIntervals.length >= 4) {
+    const avgGap = fish.mealIntervals.reduce((a,b)=>a+b,0)/fish.mealIntervals.length;
+    if (avgGap < 120 && fear < 0.3)
+      return "✓ Rythme alimentaire régulier appris — la pression de faim ne monte presque jamais.";
+    if (avgGap > 300)
+      return "Repas trop espacés — la faim grimpe dangereusement entre deux prises.";
+  }
+
   if (foodPerTick > 0.015 && fear < 0.2)
     return "✓ Excellente stratégie : mange efficacement, peu de peur inutile.";
   if (foodPerTick > 0.015 && fear > 0.4)
@@ -128,15 +144,34 @@ function behaviourTags(lin) {
 // ══════════════════════════════════════════════════════════════
 //  Spawn world — TOUS les objets correctement initialisés
 // ══════════════════════════════════════════════════════════════
-function makeFoodItem() {
-  return {
-    x: Math.random()*(W-60)+30,
-    y: Math.random()*(H-100)+30,
+function makeFoodItem(pool) {
+  const f = {
+    x: 0, y: 0,
     eaten: false,
     phase: Math.random()*Math.PI*2,
     size:  0.8 + Math.random()*0.5,
     type:  Math.floor(Math.random()*3),  // 0=pellet 1=algue 2=plancton
   };
+  placeFoodNoOverlap(f, pool || []);
+  return f;
+}
+
+// Replace food coordinates with a position that respects a minimum
+// distance from other (non-eaten) food in the same pool — avoids the
+// "stacked algae" visual mess.
+function placeFoodNoOverlap(f, pool) {
+  for (let tries = 0; tries < 8; tries++) {
+    const nx = 30 + Math.random()*(W-60);
+    const ny = 30 + Math.random()*(H-100);
+    let ok = true;
+    for (let i = 0; i < pool.length; i++) {
+      const g = pool[i];
+      if (g === f || g.eaten) continue;
+      if (dist(nx,ny,g.x,g.y) < FOOD_MIN_DIST) { ok = false; break; }
+    }
+    if (ok) { f.x = nx; f.y = ny; return; }
+    if (tries === 7) { f.x = nx; f.y = ny; } // dernier essai : on accepte
+  }
 }
 
 function spawnWorld() {
@@ -148,6 +183,13 @@ function spawnWorld() {
     const lin   = lineageData.lineages[name];
     const angle = (i/names.length)*Math.PI*2;
     const r     = Math.min(W,H)*0.28;
+
+    // Pool de nourriture propre à cette lignée (mirroir exact entraînement)
+    const foodCtx   = (lin.context && lin.context.food) || 'normal';
+    const nFood     = FOOD_COUNT_BY_CONTEXT[foodCtx] !== undefined ? FOOD_COUNT_BY_CONTEXT[foodCtx] : N_FOOD_BASE;
+    const foodPool  = [];
+    for (let k = 0; k < nFood; k++) foodPool.push(makeFoodItem(foodPool));
+
     fishes.push({
       name, color:lin.color,
       // Poids : doit être un Array plat pour slicing dans mlpForward
@@ -156,9 +198,9 @@ function spawnWorld() {
       y: H/2 + Math.sin(angle)*r,
       vx:0, vy:0,
       angle: angle+Math.PI,
-      tailPhase: Math.random()*Math.PI*2,  // ← manquait
-      tailAmp:   0.2,                       // ← manquait
-      trail:     [],                        // ← manquait
+      tailPhase: Math.random()*Math.PI*2,
+      tailAmp:   0.2,
+      trail:     [],
       alive:     true,
       foodEaten: 0,
       stepsSurvived: 0,
@@ -168,18 +210,24 @@ function spawnWorld() {
       fearAccum: 0.0,
       fearAvg:   0.0,
       dangerMem: 0.0,
+      timeSinceMeal: MEAL_SAT_TICKS,   // ← nouveau : pour input "meal_signal"
+      mealIntervals: [],               // ← historique pour insight régularité
       deathCause: null,
       finalFitness: lin.final_fitness,
       context: lin.context,
       history: lin.history,
       insight: '',
+      foodPool,                         // pool de nourriture propre à cette lignée
     });
+
+    // Le pool global "foods" reste utilisé par le rendu (drawFood itère tous les pools)
+    foods.push(...foodPool);
   });
 
-  // Nourriture : pool commun, tous objets bien formés via makeFoodItem
-  for (let i = 0; i < N_FOOD_BASE; i++) foods.push(makeFoodItem());
-
-  // Prédateur unique avec état complet
+  // Prédateur unique, mais capable de cibler n'importe quel poisson vivant
+  // et d'adapter sa vitesse au contexte (pred_aggro) de SA cible actuelle —
+  // mirroir fidèle de l'entraînement (chaque lignée affronte un prédateur
+  // dont la vitesse correspond à pred_aggro de SON propre contexte).
   preds.push({
     x: W*0.85, y: H*0.5,
     vx:0, vy:0,
@@ -192,8 +240,9 @@ function spawnWorld() {
     ambushTicks: 0,
     ambushX: W/2, ambushY: H/2,
     prevTx: null, prevTy: null,
-    tailPhase: 0,               // ← manquait dans l'ancienne version
-    speed: 1.8,                 // vitesse de base — sera modulée par lineage
+    tailPhase: 0,
+    speed: 1.8,           // valeur par défaut, réajustée dynamiquement chaque tick
+    target: null,         // référence au poisson actuellement visé
   });
 }
 
@@ -246,13 +295,37 @@ function simStep() {
       return;
     }
 
-    // Cible la plus proche
-    let target = null, minD = Infinity;
+    // Cible : la plus proche, avec un peu d'hystérésis pour éviter les
+    // changements de cible erratiques (mirroir de la règle d'abandon
+    // d'entraînement : on ne change de cible que si une proie est
+    // significativement plus proche que la cible actuelle).
+    let nearest = null, minD = Infinity;
     aliveFishes.forEach(f => {
       const d = dist(pred.x, pred.y, f.x, f.y);
-      if (d < minD) { minD = d; target = f; }
+      if (d < minD) { minD = d; nearest = f; }
     });
-    if (!target) return;
+    if (!nearest) return;
+
+    let target = pred.target && pred.target.alive ? pred.target : null;
+    if (!target) {
+      target = nearest;
+      pred.prevTx = pred.prevTy = null;
+    } else {
+      const dCur = dist(pred.x, pred.y, target.x, target.y);
+      if (nearest !== target && dist(pred.x,pred.y,nearest.x,nearest.y) < dCur*0.6) {
+        target = nearest;
+        pred.prevTx = pred.prevTy = null;
+      } else {
+        minD = dCur;
+      }
+    }
+    pred.target = target;
+
+    // Vitesse adaptée au pred_aggro de la lignée actuellement ciblée
+    // (mirroir exact de l'entraînement : chaque lignée a appris contre
+    // un prédateur à SA vitesse). Lissé pour éviter les sauts brusques.
+    const targetAggro = (target.context && target.context.pred_aggro) || 1.6;
+    pred.speed = pred.speed*0.9 + targetAggro*0.1;
 
     if (minD < AGGRO_R) {
       // ── CHASSE ──
@@ -337,7 +410,7 @@ function simStep() {
       return;
     }
 
-    const aliveFoods = foods.filter(f => !f.eaten);
+    const aliveFoods = fish.foodPool.filter(f => !f.eaten);
 
     // Inputs nourriture
     let fdDx=0, fdDy=0, fdDist=1;
@@ -379,6 +452,12 @@ function simStep() {
     // Urgence faim
     const hungerUrgency = Math.max(0, 1.0 - fish.hunger*2.5);
 
+    // Temps écoulé depuis le dernier repas (sature à 1.0) — permet au
+    // réseau d'apprendre une dynamique anticipative de la faim plutôt
+    // que de réagir seulement quand hungerUrgency explose.
+    fish.timeSinceMeal = Math.min(MEAL_SAT_TICKS, fish.timeSinceMeal + 1);
+    const mealSignal = fish.timeSinceMeal / MEAL_SAT_TICKS;
+
     const inputs = [
       fdDx, fdDy, fdDist,
       pdDx, pdDy, pdDist,
@@ -388,18 +467,21 @@ function simStep() {
       isPredActive ? 1.0 : 0.0,
       fish.dangerMem,
       hungerUrgency,
+      mealSignal,
     ];
 
     const out = mlpForward(fish.weights, inputs);
     let ax = (out[3]-out[2])*FISH_SPD;
     let ay = (out[0]-out[1])*FISH_SPD;
 
-    // Répulsion mur exponentielle
-    function wallRep(pos, lo, hi, zone=BORDER_ZONE, force=5.5) {
+    // Répulsion mur — adoucie, mirroir exact du Python (était force=5.5,
+    // exp=2.2, ce qui pouvait écraser totalement la décision du réseau
+    // dans les coins et bloquer le poisson en oscillation contre le bord).
+    function wallRep(pos, lo, hi, zone=BORDER_ZONE, force=WALL_FORCE, exp=WALL_EXP) {
       let r=0;
       const dlo = pos-lo, dhi = hi-pos;
-      if (dlo < zone) r += force*(1-dlo/zone)**2.2;
-      if (dhi < zone) r -= force*(1-dhi/zone)**2.2;
+      if (dlo < zone) r += force*(1-dlo/zone)**exp;
+      if (dhi < zone) r -= force*(1-dhi/zone)**exp;
       return r;
     }
     ax += wallRep(fish.x, 5, W-5);
@@ -431,16 +513,18 @@ function simStep() {
     fish.trail.push({x:fish.x, y:fish.y});
     if (fish.trail.length > 20) fish.trail.shift();
 
-    // Manger (recyclage sur place — PAS d'accumulation)
+    // Manger (recyclage sur place, anti-superposition dans le pool de la lignée)
     aliveFoods.forEach(f => {
       if (!f.eaten && dist(fish.x,fish.y,f.x,f.y) < FISH_R+FOOD_R) {
         fish.foodEaten++;
         fish.hunger = Math.min(1.0, fish.hunger+HUNGER_GAIN);
-        // Recycle la même entrée — évite la superposition
-        f.x = 30 + Math.random()*(W-60);
-        f.y = 30 + Math.random()*(H-100);
+        fish.mealIntervals.push(fish.timeSinceMeal);
+        if (fish.mealIntervals.length > 30) fish.mealIntervals.shift();
+        fish.timeSinceMeal = 0;
+        // Recycle la même entrée, position anti-superposition
         f.phase = Math.random()*Math.PI*2;
         f.type  = Math.floor(Math.random()*3);
+        placeFoodNoOverlap(f, fish.foodPool);
         // f.eaten reste false : pas de pool infini
       }
     });
@@ -1041,9 +1125,11 @@ canvas.addEventListener('mousemove', e => {
       <b style="color:${f.color}">${f.name}</b><br>
       nourriture : <b>${f.foodEaten}</b> (${fd[c&&c.food]||'?'})<br>
       faim : <b>${Math.round(f.hunger*100)}%</b><br>
+      depuis dernier repas : ${Math.round(f.timeSinceMeal)}t<br>
       peur actuelle : <b>${Math.round(f.fear*100)}%</b><br>
       peur moyenne : ${Math.round(f.fearAvg*100)}%<br>
       danger memory : ${Math.round(f.dangerMem*100)}%<br>
+      vitesse prédateur (cible) : ${preds[0]&&preds[0].target===f ? preds[0].speed.toFixed(2) : '—'}<br>
       fitness évol : ${f.finalFitness.toFixed(3)}
     `;
   } else {
