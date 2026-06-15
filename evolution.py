@@ -1,589 +1,650 @@
 """
-Aquarium Evolution Engine v5
-==============================
-Corrections vs v4 (qui causaient les poissons bloqués aux bords,
-prédateurs incohérents, nourriture qui se superpose) :
+Aquarium Evolution Engine — v6 (miroir de ab.js)
+=================================================
+Paradigme : population ouverte, reproduction sexuée, tempérament héréditaire.
+Plus de "lignées figées" ni de JSON à charger dans le HTML.
+Ce script est un outil d'ANALYSE HEADLESS :
+  - Simule N_RUNS populations indépendantes sur SIM_TICKS ticks
+  - Mesure convergence des tempéraments, fitness, diversité génétique
+  - Exporte stats.json (optionnel) et affiche les résultats en console
 
-PHYSIQUE / MURS
----------------
-1. Répulsion de mur RADICALEMENT adoucie : force 5.5→2.6, exposant
-   2.2→1.6, et surtout le signal de répulsion est maintenant CLAMPÉ
-   et mélangé (pas juste additionné brut) pour ne plus écraser
-   complètement la décision du réseau près des coins. Avant, dans un
-   coin, ax et ay pouvaient atteindre ±5.5 chacun (>> FISH_SPD=3.0),
-   noyant toute intention du réseau → le poisson restait "collé"
-   en oscillant.
-2. Pénalité de bord dans la fitness FORTEMENT augmentée et
-   exponentielle avec la proximité réelle (pas juste un ratio de
-   ticks) → pression sélective beaucoup plus nette pour quitter
-   les bords.
-3. Mirroir EXACT JS/Python de wall_repulse (même force, même zone,
-   même exposant).
-
-PRÉDATEUR
----------
-4. La vitesse du prédateur dans la visualisation suit maintenant
-   `pred_aggro` de la lignée du poisson actuellement pourchassé
-   (mirroir fidèle de l'entraînement, où chaque lignée affronte un
-   prédateur à SA vitesse d'agressivité).
-5. Le prédateur peut maintenant cibler n'importe quel poisson vivant
-   (pas seulement "le plus proche au moment du spawn") et change de
-   cible si une proie plus proche apparaît à <0.6×distance actuelle
-   (mirroir de la règle "abandon de cible").
-
-NOURRITURE
-----------
-6. Pool de nourriture PROPRE À CHAQUE LIGNÉE, dimensionné selon son
-   contexte d'entraînement (rich=32, normal=22, sparse=10) — un
-   poisson "Vert" (sparse) ne voit que SES 10 nourritures, comme à
-   l'entraînement. Évite la superposition visuelle générale et rend
-   le comportement cohérent avec ce que le réseau a appris.
-7. Anti-superposition : toute nouvelle position de nourriture
-   (spawn ou recyclage) est tirée jusqu'à respecter une distance
-   minimale (28px) avec les autres nourritures de SON pool.
-
-RÉSEAU (inputs 15, INPUT_SIZE 14→15)
--------------------------------------
-8. Nouvel input 14 : "time_since_meal" — temps écoulé (normalisé,
-   sature à 1.0 après ~400 ticks) depuis le dernier repas. Permet au
-   réseau d'apprendre une vraie dynamique de "pression de faim qui
-   redescend quand on mange régulièrement" — signal complémentaire
-   de hunger_urgency (qui ne réagit qu'en fin de réserve). Avec ce
-   signal, on peut observer le réseau apprendre à anticiper la faim
-   plutôt que d'y réagir trop tard.
-
-FITNESS / PRESSION DE SURVIE
------------------------------
-9. Mourir de faim sans avoir JAMAIS mangé : pénalité encore plus
-   sévère (×0.05 au lieu de ×0.10) — "ne pas comprendre qu'il faut
-   manger" est désormais quasi-fatal pour le score.
-10. Bonus de régularité alimentaire : récompense additionnelle basée
-    sur le temps moyen entre deux repas (favorise une stratégie de
-    nutrition régulière plutôt que famine puis festin).
-11. ENTRAÎNEMENT PLUS POUSSÉ : N_GENERATIONS 22→34, POP_SIZE 24→28,
-    N_SEEDS 4→5 — convergence plus robuste, comportements de survie
-    plus nets observables à la fin.
-
-OUTPUT : identique (4 sorties différentielles)
+Usage :
+    python evolution.py              # analyse standard
+    python evolution.py --ticks 8000 --runs 3
 """
 
+import argparse, json, math, random
 import numpy as np
-import json
-import random
-from multiprocessing import Pool, cpu_count
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any
 
-# ── Monde ─────────────────────────────────────────────────────────────────────
-WORLD_W, WORLD_H = 800, 600
-N_FOOD_BASE      = 22
-MAX_STEPS        = 2500
-N_GENERATIONS    = 80
-POP_SIZE         = 28
-ELITE_K          = 6
-N_SEEDS          = 5
-MUT_INIT         = 0.13
-MUT_MIN          = 0.025
-MUT_MAX          = 0.32
-STAG_WINDOW      = 4
+# ══════════════════════════════════════════════════════════════
+#  Constantes — miroir EXACT de ab.js
+# ══════════════════════════════════════════════════════════════
+W, H = 800, 600
 
-# ── Réseau (MIROIR EXACT DANS LE HTML) ────────────────────────────────────────
-# Inputs (15) :
-#  0-2  : nourriture  (dx/W, dy/H, dist_norm)
-#  3-5  : prédateur   (dx/W, dy/H, dist_norm)
-#  6-7  : murs        (dist_x_norm, dist_y_norm)
-#  8-9  : vélocité    (vx/MAX_SPD, vy/MAX_SPD)
-#  10   : peur        [0,1]
-#  11   : pred_active [0,1]
-#  12   : danger_memory [0,1]
-#  13   : hunger_urgency [0,1]
-#  14   : time_since_meal [0,1]  ← NOUVEAU
-INPUT_SIZE  = 15
+# MLP
+INPUT_SIZE  = 16
 HIDDEN_SIZE = 18
 OUTPUT_SIZE = 4
-MAX_SPD     = 3.2
-FISH_SPD    = 3.0
-PANIC_DIST  = 100
+N_W1 = INPUT_SIZE  * HIDDEN_SIZE
+N_B1 = HIDDEN_SIZE
+N_W2 = HIDDEN_SIZE * OUTPUT_SIZE
+N_B2 = OUTPUT_SIZE
+N_WEIGHTS = N_W1 + N_B1 + N_W2 + N_B2
 
-HUNGER_DEC   = 1.0 / (MAX_STEPS * 0.75)   # meurt si 0 nourriture sur 75% de la durée
-HUNGER_GAIN  = 0.40
-BORDER_ZONE  = 80    # pixels : zone de répulsion / pénalité bord
-WALL_FORCE   = 2.6   # force de répulsion (mirroir exact JS)
-WALL_EXP     = 1.6   # exposant de répulsion (mirroir exact JS)
-MEAL_SAT_TICKS = 400.0  # ticks pour saturer time_since_meal à 1.0
+# Physique
+MAX_SPD        = 3.2
+FISH_SPD       = 3.0
+PANIC_DIST_BASE= 100.0
+FOOD_R         = 11
+PRED_R         = 16
+FISH_R         = 9
+BORDER_ZONE    = 80.0
+WALL_FORCE     = 2.6
+WALL_EXP       = 1.6
+MEAL_SAT_TICKS = 400.0
+FOOD_MIN_DIST  = 28
 
-LINEAGE_CONTEXTS = {
-    "Rouge":  {"pred_aggro": 2.6, "food": "normal", "color": "#e74c3c",
-               "desc": "Prédateur ultra-agressif — sélection fuite pure"},
-    "Bleu":   {"pred_aggro": 0.9, "food": "rich",   "color": "#3498db",
-               "desc": "Env. favorable — optimise rendement alimentaire"},
-    "Vert":   {"pred_aggro": 1.6, "food": "sparse", "color": "#27ae60",
-               "desc": "Nourriture rare — exploration longue distance"},
-    "Violet": {"pred_aggro": 2.0, "food": "normal", "color": "#8e44ad",
-               "desc": "Pression mixte — compromis fuite/chasse"},
-    "Orange": {"pred_aggro": 1.1, "food": "sparse", "color": "#e67e22",
-               "desc": "Prédateur lent, env. pauvre — efficacité pure"},
-}
+# Écologie
+N_FOOD             = 34
+FOOD_RESPAWN_BASE  = 0.045
+ECO_K              = 9
+HUNGER_GAIN        = 0.40
 
+# Cycle de vie
+START_POP      = 9
+MIN_POP        = 3
+MATURITY_AGE   = 600
+REPRO_ENERGY   = 0.72
+REPRO_COST     = 0.30
+REPRO_COOLDOWN = 500
+REPRO_RANGE    = 42
+MAX_AGE        = 9000
+OLD_AGE_DEATH  = 0.0006
 
-# ── MLP ───────────────────────────────────────────────────────────────────────
+# Génétique
+MUT_STD          = 0.12
+MUT_BIG_PROB     = 0.05
+MUT_BIG_MULT     = 3.0
+TEMP_MUT_STD     = 0.06
 
-class MLP:
-    def __init__(self, w=None):
-        if w is None:
-            s1 = np.sqrt(2.0 / (INPUT_SIZE + HIDDEN_SIZE))
-            s2 = np.sqrt(2.0 / (HIDDEN_SIZE + OUTPUT_SIZE))
-            self.w = np.concatenate([
-                np.random.randn(INPUT_SIZE * HIDDEN_SIZE) * s1,
-                np.zeros(HIDDEN_SIZE),
-                np.random.randn(HIDDEN_SIZE * OUTPUT_SIZE) * s2,
-                np.zeros(OUTPUT_SIZE),
-            ])
+# Prédateur
+AGGRO_R          = 230.0
+ABANDON_R        = 290.0
+MAX_CHASE_TICKS  = 220
+PRED_BASE_SPEED  = 1.6
+
+# ══════════════════════════════════════════════════════════════
+#  MLP — miroir exact de ab.js (layout poids identique)
+# ══════════════════════════════════════════════════════════════
+def xavier(fan_in, fan_out, n, rng):
+    std = math.sqrt(2.0 / (fan_in + fan_out))
+    return rng.normal(0, std, n)
+
+def random_weights(rng) -> np.ndarray:
+    w = np.zeros(N_WEIGHTS)
+    idx = 0
+    w[idx:idx+N_W1] = xavier(INPUT_SIZE, HIDDEN_SIZE, N_W1, rng); idx += N_W1
+    idx += N_B1   # biais initialisés à 0
+    w[idx:idx+N_W2] = xavier(HIDDEN_SIZE, OUTPUT_SIZE, N_W2, rng); idx += N_W2
+    # b2 = 0
+    return w
+
+def mlp_forward(weights: np.ndarray, x: np.ndarray) -> np.ndarray:
+    idx = 0
+    W1 = weights[idx:idx+N_W1].reshape(HIDDEN_SIZE, INPUT_SIZE);  idx += N_W1
+    b1 = weights[idx:idx+N_B1];                                    idx += N_B1
+    W2 = weights[idx:idx+N_W2].reshape(OUTPUT_SIZE, HIDDEN_SIZE);  idx += N_W2
+    b2 = weights[idx:idx+N_B2]
+    h  = np.tanh(W1 @ x + b1)
+    return np.tanh(W2 @ h + b2)
+
+def crossover_weights(wa: np.ndarray, wb: np.ndarray, rng) -> np.ndarray:
+    a = 0.25 + rng.random() * 0.5   # a in [0.25, 0.75]
+    return a * wa + (1 - a) * wb
+
+def mutate_weights(w: np.ndarray, rng) -> np.ndarray:
+    noise = rng.normal(0, MUT_STD, N_WEIGHTS)
+    big   = rng.random(N_WEIGHTS) < MUT_BIG_PROB
+    noise[big] *= MUT_BIG_MULT
+    return w + noise
+
+# ══════════════════════════════════════════════════════════════
+#  Tempérament — miroir de ab.js
+# ══════════════════════════════════════════════════════════════
+TEMP_KEYS = ('perception', 'metabolism', 'socialPull', 'boldness')
+
+def random_temperament(rng) -> dict:
+    return {k: float(rng.random()) for k in TEMP_KEYS}
+
+def crossover_temperament(ta: dict, tb: dict, rng) -> dict:
+    out = {}
+    for k in TEMP_KEYS:
+        a = rng.random()
+        out[k] = float(np.clip(a*ta[k] + (1-a)*tb[k], 0, 1))
+    return out
+
+def mutate_temperament(t: dict, rng) -> dict:
+    return {k: float(np.clip(t[k] + rng.normal(0, TEMP_MUT_STD), 0, 1)) for k in TEMP_KEYS}
+
+def temperament_label(t: dict) -> str:
+    tags = []
+    tags.append('myope'       if t['perception'] < 0.35 else 'clairvoyant' if t['perception'] > 0.65 else None)
+    tags.append('économe'     if t['metabolism'] < 0.35 else 'glouton'     if t['metabolism'] > 0.65 else None)
+    tags.append('solitaire'   if t['socialPull'] < 0.35 else 'grégaire'    if t['socialPull'] > 0.65 else None)
+    tags.append('anxieux'     if t['boldness']   < 0.35 else 'téméraire'   if t['boldness']   > 0.65 else None)
+    present = [x for x in tags if x]
+    return ' · '.join(present) if present else 'équilibré'
+
+# ══════════════════════════════════════════════════════════════
+#  Entités
+# ══════════════════════════════════════════════════════════════
+_next_id = 1
+
+@dataclass
+class Fish:
+    id:           int
+    gen:          int
+    weights:      np.ndarray
+    temperament:  dict
+    x: float;    y: float
+    vx: float = 0.0;  vy: float = 0.0
+    alive:        bool = True
+    age:          int  = 0
+    energy:       float = 1.0
+    food_eaten:   int  = 0
+    steps_survived: int = 0
+    distance_traveled: float = 0.0
+    fear:         float = 0.0
+    fear_accum:   float = 0.0
+    fear_avg:     float = 0.0
+    danger_mem:   float = 0.0
+    time_since_meal: float = MEAL_SAT_TICKS * 0.4
+    meal_intervals: list = field(default_factory=list)
+    repro_cooldown: float = MATURITY_AGE * 0.3
+    children:     int  = 0
+    death_cause:  Optional[str] = None
+    parents:      Optional[tuple] = None
+
+@dataclass
+class Food:
+    x: float; y: float
+    eaten: bool = False
+
+@dataclass
+class Predator:
+    x: float; y: float
+    vx: float = 0.0; vy: float = 0.0
+    active: bool = False
+    on_timer: int = 0
+    cooldown: float = 0.0
+    mode: str = 'rôde'
+    chase_ticks: int = 0
+    ambush_ticks: int = 0
+    ambush_x: float = W/2; ambush_y: float = H/2
+    prev_tx: Optional[float] = None; prev_ty: Optional[float] = None
+    speed: float = PRED_BASE_SPEED
+    target_id: Optional[int] = None
+
+# ══════════════════════════════════════════════════════════════
+#  Helpers
+# ══════════════════════════════════════════════════════════════
+def d(x1,y1,x2,y2): return math.hypot(x2-x1, y2-y1)
+
+def place_food_no_overlap(f: Food, pool: list, rng):
+    for _ in range(8):
+        nx = 30 + rng.random()*(W-60)
+        ny = 30 + rng.random()*(H-100)
+        ok = all(g is f or g.eaten or d(nx,ny,g.x,g.y) >= FOOD_MIN_DIST for g in pool)
+        if ok: f.x, f.y = nx, ny; return
+    f.x, f.y = 30 + rng.random()*(W-60), 30 + rng.random()*(H-100)
+
+def make_food(pool, rng) -> Food:
+    f = Food(0, 0)
+    place_food_no_overlap(f, pool, rng)
+    return f
+
+def make_fish(rng, gen=0, weights=None, temperament=None,
+              x=None, y=None, energy=1.0, repro_cooldown=None, parents=None) -> Fish:
+    global _next_id
+    t = temperament or random_temperament(rng)
+    fish = Fish(
+        id=_next_id, gen=gen,
+        weights=weights if weights is not None else random_weights(rng),
+        temperament=t,
+        x=x if x is not None else 60+rng.random()*(W-120),
+        y=y if y is not None else 60+rng.random()*(H-120),
+        energy=energy,
+        repro_cooldown=repro_cooldown if repro_cooldown is not None else MATURITY_AGE*0.3,
+        parents=parents,
+    )
+    _next_id += 1
+    return fish
+
+def wall_rep(pos, lo, hi, zone=BORDER_ZONE, force=WALL_FORCE, exp=WALL_EXP):
+    r = 0.0
+    dlo = pos - lo; dhi = hi - pos
+    if dlo < zone: r += force*(1-dlo/zone)**exp
+    if dhi < zone: r -= force*(1-dhi/zone)**exp
+    return r
+
+# ══════════════════════════════════════════════════════════════
+#  Prédateur — miroir de stepPredator() dans ab.js
+# ══════════════════════════════════════════════════════════════
+def step_predator(pred: Predator, alive_fishes: list, rng):
+    # Timer
+    if pred.active:
+        pred.on_timer -= 1
+        if pred.on_timer <= 0:
+            pred.active    = False
+            pred.cooldown  = 280 + rng.random()*200
+            pred.mode      = 'rôde'
+            pred.chase_ticks = 0
+            pred.prev_tx   = pred.prev_ty = None
+            pred.target_id = None
+    else:
+        pred.cooldown -= 1
+        if pred.cooldown <= 0:
+            pred.active       = True
+            pred.on_timer     = int(160 + rng.random()*100)
+            pred.chase_ticks  = pred.ambush_ticks = 0
+            pred.prev_tx      = pred.prev_ty = None
+            pred.mode         = 'rôde'
+            side = rng.integers(0, 4)
+            if   side == 0: pred.x, pred.y = 8,   60+rng.random()*(H-120)
+            elif side == 1: pred.x, pred.y = W-8,  60+rng.random()*(H-120)
+            elif side == 2: pred.x, pred.y = 60+rng.random()*(W-120), 8
+            else:           pred.x, pred.y = 60+rng.random()*(W-120), H-8
+            pred.vx = pred.vy = 0.0
+
+    if not pred.active or not alive_fishes:
+        pred.vx = pred.vx*0.93 + (W/2-pred.x)/W*0.5 + (rng.random()-0.5)*0.6
+        pred.vy = pred.vy*0.93 + (H/2-pred.y)/H*0.5 + (rng.random()-0.5)*0.6
+        pred.mode = 'rôde'
+        pred.x = float(np.clip(pred.x+pred.vx, 5, W-5))
+        pred.y = float(np.clip(pred.y+pred.vy, 5, H-5))
+        return
+
+    # Vitesse adaptée à l'audace moyenne (miroir ab.js)
+    avg_bold = sum(f.temperament['boldness'] for f in alive_fishes) / len(alive_fishes)
+    target_spd = PRED_BASE_SPEED * (0.85 + avg_bold*0.35)
+    pred.speed = pred.speed*0.95 + target_spd*0.05
+
+    # Cible avec hystérésis
+    nearest = min(alive_fishes, key=lambda f: d(pred.x,pred.y,f.x,f.y))
+    min_d   = d(pred.x, pred.y, nearest.x, nearest.y)
+    target_fish = next((f for f in alive_fishes if f.id == pred.target_id), None)
+    if target_fish is None:
+        target_fish = nearest; pred.prev_tx = pred.prev_ty = None
+    else:
+        d_cur = d(pred.x,pred.y,target_fish.x,target_fish.y)
+        if nearest is not target_fish and min_d < d_cur*0.6:
+            target_fish = nearest; pred.prev_tx = pred.prev_ty = None
         else:
-            self.w = w.copy()
+            min_d = d_cur
+    pred.target_id = target_fish.id
 
-    def forward(self, x):
-        i = 0
-        W1 = self.w[i:i+INPUT_SIZE*HIDDEN_SIZE].reshape(INPUT_SIZE, HIDDEN_SIZE); i += INPUT_SIZE*HIDDEN_SIZE
-        b1 = self.w[i:i+HIDDEN_SIZE]; i += HIDDEN_SIZE
-        W2 = self.w[i:i+HIDDEN_SIZE*OUTPUT_SIZE].reshape(HIDDEN_SIZE, OUTPUT_SIZE); i += HIDDEN_SIZE*OUTPUT_SIZE
-        b2 = self.w[i:i+OUTPUT_SIZE]
-        h  = np.tanh(x @ W1 + b1)
-        return np.tanh(h @ W2 + b2)
+    if min_d < AGGRO_R:
+        pred.mode = 'chasse'; pred.chase_ticks += 1; pred.ambush_ticks = 0
+        tx, ty = target_fish.x, target_fish.y
+        if pred.prev_tx is not None:
+            h = min(min_d / max(pred.speed*1.5, 0.1), 18)
+            tx = float(np.clip(tx + (tx-pred.prev_tx)*h, 5, W-5))
+            ty = float(np.clip(ty + (ty-pred.prev_ty)*h, 5, H-5))
+        pred.prev_tx, pred.prev_ty = target_fish.x, target_fish.y
+        dx = tx-pred.x; dy = ty-pred.y; dn = max(math.hypot(dx,dy), 1)
+        pred.vx = pred.vx*0.50 + (dx/dn)*pred.speed*0.50
+        pred.vy = pred.vy*0.50 + (dy/dn)*pred.speed*0.50
 
-    def mutate(self, std):
-        # Mutation avec prob de perturbation forte occasionnelle (5%)
-        noise = np.random.randn(*self.w.shape) * std
-        big_mut_mask = np.random.rand(*self.w.shape) < 0.05
-        noise[big_mut_mask] *= 3.0
-        return MLP(self.w + noise)
+        if min_d > ABANDON_R or pred.chase_ticks > MAX_CHASE_TICKS:
+            pred.mode = 'embuscade'; pred.chase_ticks = 0
+            pred.prev_tx = pred.prev_ty = None
+            pcx = sum(f.x for f in alive_fishes)/len(alive_fishes)
+            pcy = sum(f.y for f in alive_fishes)/len(alive_fishes)
+            pred.ambush_x = (pred.x+pcx)/2; pred.ambush_y = (pred.y+pcy)/2
+            pred.ambush_ticks = 0
 
-    def crossover(self, other):
-        # BLX-alpha crossover
-        a = np.random.uniform(0.25, 0.75)
-        return MLP(a * self.w + (1 - a) * other.w)
+    elif pred.mode == 'embuscade':
+        pred.ambush_ticks += 1
+        dx = pred.ambush_x-pred.x; dy = pred.ambush_y-pred.y
+        dn = max(math.hypot(dx,dy), 1)
+        if dn > 10:
+            pred.vx = pred.vx*0.7 + (dx/dn)*pred.speed*0.12
+            pred.vy = pred.vy*0.7 + (dy/dn)*pred.speed*0.12
+        else:
+            pred.vx *= 0.8; pred.vy *= 0.8
+        if pred.ambush_ticks > 90 + rng.random()*60:
+            pred.mode = 'rôde'; pred.ambush_ticks = 0
+            pred.prev_tx = pred.prev_ty = None
+    else:
+        pred.mode = 'rôde'; pred.chase_ticks = 0
+        pred.prev_tx = pred.prev_ty = None
+        pcx = sum(f.x for f in alive_fishes)/len(alive_fishes)
+        pcy = sum(f.y for f in alive_fishes)/len(alive_fishes)
+        dx = pcx-pred.x; dy = pcy-pred.y; dn = max(math.hypot(dx,dy), 1)
+        pred.vx = pred.vx*0.92 + (dx/dn)*pred.speed*0.22 + (rng.random()-0.5)*0.3
+        pred.vy = pred.vy*0.92 + (dy/dn)*pred.speed*0.22 + (rng.random()-0.5)*0.3
 
-    def to_list(self):
-        return self.w.tolist()
+    pspd = math.hypot(pred.vx, pred.vy)
+    if pspd > pred.speed*1.6:
+        pred.vx *= pred.speed*1.6/pspd; pred.vy *= pred.speed*1.6/pspd
+    pred.x = float(np.clip(pred.x+pred.vx, 5, W-5))
+    pred.y = float(np.clip(pred.y+pred.vy, 5, H-5))
 
-    @classmethod
-    def from_list(cls, d):
-        return cls(np.array(d))
+# ══════════════════════════════════════════════════════════════
+#  Poisson — miroir de stepFish() dans ab.js
+# ══════════════════════════════════════════════════════════════
+def step_fish(fish: Fish, alive_fishes: list, foods: list, preds: list, rng):
+    t = fish.temperament
+    fish.steps_survived += 1
+    fish.age += 1
+    if fish.repro_cooldown > 0: fish.repro_cooldown -= 1
 
+    # Métabolisme
+    hunger_dec = (1.0/(2500*0.75)) * (0.7 + t['metabolism']*0.65)
+    fish.energy = max(0.0, fish.energy - hunger_dec)
+    if fish.energy <= 0:
+        fish.alive      = False
+        fish.death_cause= 'starvation'
+        return
 
-# ── Prédateur (3 modes) ───────────────────────────────────────────────────────
+    alive_foods = [f for f in foods if not f.eaten]
+    pnoise = (1 - t['perception']) * 0.35
 
-class Pred:
-    """
-    Modes :
-    - 'rôde'      : dérive lente vers le centroïde des proies
-    - 'embuscade' : s'immobilise dans un point stratégique, attend
-    - 'chasse'    : interception prédictive avec horizon adaptatif
-    """
-    AGGRO_R     = 230
-    ABANDON_R   = 290
-    MAX_CHASE   = 220
-    AMBUSH_TICKS = 80   # durée min d'une embuscade
+    # Nourriture la plus proche
+    fd_dx = fd_dy = 0.0; fd_dist = 1.0
+    if alive_foods:
+        closest = min(alive_foods, key=lambda f: d(fish.x,fish.y,f.x,f.y))
+        min_df  = d(fish.x, fish.y, closest.x, closest.y)
+        fd_dx   = (closest.x-fish.x)/W + (rng.random()-0.5)*pnoise
+        fd_dy   = (closest.y-fish.y)/H + (rng.random()-0.5)*pnoise
+        fd_dist = float(np.clip(min_df/(W*0.5) + (rng.random()-0.5)*pnoise*0.5, 0, 1))
 
-    def __init__(self, aggro_speed: float, rng: np.random.Generator):
-        self.x = float(rng.uniform(100, WORLD_W - 100))
-        self.y = float(rng.uniform(100, WORLD_H - 100))
-        self.vx = self.vy = 0.0
-        self.speed      = aggro_speed
-        self.mode       = 'rôde'
-        self.chase_t    = 0
-        self.ambush_t   = 0
-        self.ambush_x   = 0.0
-        self.ambush_y   = 0.0
-        self.prev_tx    = self.prev_ty = None
+    # Prédateur
+    pd_dx = pd_dy = 0.0; pd_dist = 1.0; min_pd = float('inf'); closest_pred = None
+    for p in preds:
+        dd = d(fish.x, fish.y, p.x, p.y)
+        if dd < min_pd: min_pd = dd; closest_pred = p
+    is_pred_active = closest_pred is not None and closest_pred.active
+    if closest_pred:
+        pd_dx   = (closest_pred.x-fish.x)/W + (rng.random()-0.5)*pnoise
+        pd_dy   = (closest_pred.y-fish.y)/H + (rng.random()-0.5)*pnoise
+        pd_dist = float(np.clip(min_pd/(W*0.5) + (rng.random()-0.5)*pnoise*0.5, 0, 1))
 
-    def _nearest(self, fish_pos):
-        if not fish_pos:
-            return None, 9999.0
-        dists = [(np.sqrt((self.x-fx)**2+(self.y-fy)**2), (fx,fy)) for fx,fy in fish_pos]
-        dists.sort(key=lambda d: d[0])
-        return dists[0][1], dists[0][0]
+    # Murs
+    wx = min(fish.x, W-fish.x)/(W*0.5)
+    wy = min(fish.y, H-fish.y)/(H*0.5)
 
-    def step(self, fish_pos, active, rng):
-        if not active or not fish_pos:
-            # Dérive lente, retour vers le centre
-            cx, cy = WORLD_W/2, WORLD_H/2
-            self.vx = self.vx*0.94 + (cx-self.x)/WORLD_W*0.4 + rng.uniform(-0.3,0.3)
-            self.vy = self.vy*0.94 + (cy-self.y)/WORLD_H*0.4 + rng.uniform(-0.3,0.3)
-            self.mode = 'rôde'
-            self.chase_t = 0
-            self._move()
+    # Signal social (miroir exact ab.js)
+    soc_dx = soc_dy = 0.0; neighbors = 0
+    for o in alive_fishes:
+        if o is fish: continue
+        dd = d(fish.x, fish.y, o.x, o.y)
+        if 0.001 < dd < 160:
+            soc_dx += (o.x-fish.x)/dd; soc_dy += (o.y-fish.y)/dd; neighbors += 1
+    soc_signal = 0.0
+    if neighbors > 0:
+        soc_dx /= neighbors; soc_dy /= neighbors
+        soc_signal = math.hypot(soc_dx, soc_dy)
+    soc_weight = 0.2 + t['socialPull']*0.8
+
+    # Danger memory
+    if is_pred_active and min_pd < 260:
+        fish.danger_mem = min(1.0, fish.danger_mem + 0.18*(1-pd_dist))
+    else:
+        fish.danger_mem = max(0.0, fish.danger_mem*0.97)
+
+    # Faim urgence + signal temporel
+    hunger_urgency = max(0.0, 1.0 - fish.energy*2.5)
+    fish.time_since_meal = min(MEAL_SAT_TICKS, fish.time_since_meal+1)
+    meal_signal = fish.time_since_meal / MEAL_SAT_TICKS
+
+    inp = np.array([
+        fd_dx, fd_dy, fd_dist,
+        pd_dx, pd_dy, pd_dist,
+        wx, wy,
+        fish.vx/MAX_SPD, fish.vy/MAX_SPD,
+        fish.fear,
+        1.0 if is_pred_active else 0.0,
+        fish.danger_mem,
+        hunger_urgency,
+        meal_signal,
+        soc_signal,   # input 15 = densité/force du groupe
+    ], dtype=np.float64)
+
+    out = mlp_forward(fish.weights, inp)
+    ax = (out[3]-out[2])*FISH_SPD
+    ay = (out[0]-out[1])*FISH_SPD
+
+    # Influence sociale directe (miroir ab.js)
+    if neighbors > 0:
+        ax += soc_dx * soc_weight * 0.9
+        ay += soc_dy * soc_weight * 0.9
+
+    # Répulsion mur
+    ax += wall_rep(fish.x, 5, W-5)
+    ay += wall_rep(fish.y, 5, H-5)
+
+    # Réflexe panique (modulé par boldness)
+    panic_dist = PANIC_DIST_BASE * (1.3 - t['boldness']*0.6)
+    if is_pred_active and min_pd < panic_dist:
+        dxp = fish.x - closest_pred.x; dyp = fish.y - closest_pred.y
+        dn  = max(math.hypot(dxp,dyp), 1)
+        ax  = (dxp/dn)*FISH_SPD*1.6
+        ay  = (dyp/dn)*FISH_SPD*1.6
+
+    max_spd = MAX_SPD * (0.92 + t['metabolism']*0.16)
+    fish.vx = fish.vx*0.50 + ax*0.50
+    fish.vy = fish.vy*0.50 + ay*0.50
+    spd = math.hypot(fish.vx, fish.vy)
+    if spd > max_spd: fish.vx *= max_spd/spd; fish.vy *= max_spd/spd
+
+    prev_x, prev_y = fish.x, fish.y
+    fish.x = float(np.clip(fish.x+fish.vx, 5, W-5))
+    fish.y = float(np.clip(fish.y+fish.vy, 5, H-5))
+    moved  = math.hypot(fish.x-prev_x, fish.y-prev_y)
+    fish.distance_traveled += moved
+
+    # Manger
+    hunger_gain = HUNGER_GAIN * (0.9 + t['metabolism']*0.25)
+    for f in alive_foods:
+        if not f.eaten and d(fish.x,fish.y,f.x,f.y) < FISH_R+FOOD_R:
+            fish.food_eaten += 1
+            fish.energy      = min(1.0, fish.energy + hunger_gain)
+            fish.meal_intervals.append(fish.time_since_meal)
+            if len(fish.meal_intervals) > 30: fish.meal_intervals.pop(0)
+            fish.time_since_meal = 0.0
+            f.eaten = True
+
+    # Mort prédateur
+    for pred in preds:
+        if pred.active and d(fish.x,fish.y,pred.x,pred.y) < FISH_R+PRED_R:
+            fish.alive      = False
+            fish.death_cause= 'predator'
             return
 
-        target, d = self._nearest(fish_pos)
-
-        if d < self.AGGRO_R:
-            # ── Mode CHASSE ──────────────────────────────────────────────────
-            self.mode = 'chasse'
-            self.chase_t += 1
-            self.ambush_t = 0
-
-            tx, ty = target
-            if self.prev_tx is not None:
-                # Interception prédictive : horizon inversement proportionnel à la vitesse
-                h = min(d / max(self.speed * 1.5, 0.1), 18.0)
-                tx += (tx - self.prev_tx) * h
-                ty += (ty - self.prev_ty) * h
-                tx = float(np.clip(tx, 5, WORLD_W-5))
-                ty = float(np.clip(ty, 5, WORLD_H-5))
-            self.prev_tx, self.prev_ty = target
-
-            dx = tx - self.x; dy = ty - self.y
-            dn = max(np.sqrt(dx*dx+dy*dy), 1.0)
-            self.vx = self.vx*0.50 + (dx/dn)*self.speed*0.50
-            self.vy = self.vy*0.50 + (dy/dn)*self.speed*0.50
-
-            # Abandon si trop loin ou trop longtemps
-            if d > self.ABANDON_R or self.chase_t > self.MAX_CHASE:
-                self.mode = 'embuscade'
-                self.chase_t = 0
-                self.prev_tx = None
-                # Point d'embuscade : mi-chemin vers le centroïde des proies
-                if fish_pos:
-                    pcx = float(np.mean([p[0] for p in fish_pos]))
-                    pcy = float(np.mean([p[1] for p in fish_pos]))
-                    self.ambush_x = (self.x + pcx) / 2
-                    self.ambush_y = (self.y + pcy) / 2
-                else:
-                    self.ambush_x = self.x
-                    self.ambush_y = self.y
-
-        elif self.mode == 'embuscade':
-            # ── Mode EMBUSCADE ───────────────────────────────────────────────
-            self.ambush_t += 1
-            dx = self.ambush_x - self.x; dy = self.ambush_y - self.y
-            dn = max(np.sqrt(dx*dx+dy*dy), 1.0)
-            if dn > 8:
-                # Se déplace vers le point d'embuscade lentement
-                self.vx = self.vx*0.7 + (dx/dn)*self.speed*0.15
-                self.vy = self.vy*0.7 + (dy/dn)*self.speed*0.15
-            else:
-                # Immobile, attend
-                self.vx *= 0.85
-                self.vy *= 0.85
-            if self.ambush_t > self.AMBUSH_TICKS:
-                self.mode = 'rôde'
-                self.ambush_t = 0
-                self.prev_tx = None
-
-        else:
-            # ── Mode RÔDE ────────────────────────────────────────────────────
-            self.mode = 'rôde'
-            self.prev_tx = None
-            self.chase_t = 0
-            # Dérive vers le centroïde des proies (vitesse 25%)
-            pcx = float(np.mean([p[0] for p in fish_pos]))
-            pcy = float(np.mean([p[1] for p in fish_pos]))
-            dx = pcx - self.x; dy = pcy - self.y
-            dn = max(np.sqrt(dx*dx+dy*dy), 1.0)
-            self.vx = self.vx*0.93 + (dx/dn)*self.speed*0.25 + rng.uniform(-0.2,0.2)
-            self.vy = self.vy*0.93 + (dy/dn)*self.speed*0.25 + rng.uniform(-0.2,0.2)
-
-        self._move()
-
-    def _move(self):
-        # Clamp vitesse
-        spd = np.sqrt(self.vx**2 + self.vy**2)
-        if spd > self.speed * 1.5:
-            self.vx *= self.speed * 1.5 / spd
-            self.vy *= self.speed * 1.5 / spd
-        self.x = float(np.clip(self.x + self.vx, 5, WORLD_W-5))
-        self.y = float(np.clip(self.y + self.vy, 5, WORLD_H-5))
-
-
-# ── Répulsion de mur (MIROIR EXACT JS) ─────────────────────────────────────────
-
-def wall_repulse(pos, lo, hi, force=WALL_FORCE, zone=BORDER_ZONE, exp=WALL_EXP):
-    dist_lo = pos - lo; dist_hi = hi - pos
-    rep = 0.0
-    if dist_lo < zone:
-        rep += force * (1.0 - dist_lo/zone) ** exp
-    if dist_hi < zone:
-        rep -= force * (1.0 - dist_hi/zone) ** exp
-    return rep
-
-
-# ── Simulation ────────────────────────────────────────────────────────────────
-
-def run_sim(brain, ctx, seed):
-    rng = np.random.default_rng(seed)
-    nf  = {"rich": 32, "normal": N_FOOD_BASE, "sparse": 10}[ctx["food"]]
-    foods = [[float(rng.uniform(20, WORLD_W-20)),
-              float(rng.uniform(20, WORLD_H-20)), False] for _ in range(nf)]
-
-    pred           = Pred(ctx["pred_aggro"], rng)
-    pred_active    = False
-    pred_on_timer  = 0
-    pred_cooldown  = int(rng.uniform(80, 220))  # premier spawn rapide
-
-    fx = float(rng.uniform(100, WORLD_W-100))
-    fy = float(rng.uniform(100, WORLD_H-100))
-    vx = vy = 0.0
-    fear          = 0.0
-    danger_memory = 0.0   # souvenir de la dernière position du prédateur
-    food_eaten    = 0
-    dist_tot      = 0.0
-    border_pen    = 0.0   # pénalité bord cumulée (exponentielle)
-    hunger        = 1.0
-    died_starvation = False
-    ticks_since_meal = MEAL_SAT_TICKS  # commence "affamé depuis longtemps"
-    meal_intervals = []   # historique des écarts entre repas (régularité)
-
-    for step in range(MAX_STEPS):
-        # ── Faim ──────────────────────────────────────────────────────────────
-        hunger = max(0.0, hunger - HUNGER_DEC)
-        if hunger <= 0.0:
-            died_starvation = True
-            break
-
-        ticks_since_meal = min(MEAL_SAT_TICKS, ticks_since_meal + 1)
-
-        # ── Timer prédateur ───────────────────────────────────────────────────
-        if pred_active:
-            pred_on_timer -= 1
-            if pred_on_timer <= 0:
-                pred_active = False
-                pred_cooldown = int(rng.uniform(250, 450))
-        else:
-            pred_cooldown -= 1
-            if pred_cooldown <= 0:
-                pred_active    = True
-                pred_on_timer  = int(rng.uniform(150, 250))
-                side = rng.choice(["left","right","top","bottom"])
-                if side == "left":
-                    pred.x, pred.y = 8.0, float(rng.uniform(60, WORLD_H-60))
-                elif side == "right":
-                    pred.x, pred.y = WORLD_W-8.0, float(rng.uniform(60, WORLD_H-60))
-                elif side == "top":
-                    pred.x, pred.y = float(rng.uniform(60, WORLD_W-60)), 8.0
-                else:
-                    pred.x, pred.y = float(rng.uniform(60, WORLD_W-60)), WORLD_H-8.0
-                pred.vx = pred.vy = 0.0
-                pred.chase_t = pred.ambush_t = 0
-                pred.prev_tx = pred.prev_ty = None
-
-        # ── Inputs nourriture ─────────────────────────────────────────────────
-        alive_f = [(f[0], f[1]) for f in foods if not f[2]]
-        if alive_f:
-            df  = [np.sqrt((fx-a[0])**2+(fy-a[1])**2) for a in alive_f]
-            ci  = int(np.argmin(df))
-            fd_dx = (alive_f[ci][0]-fx)/WORLD_W
-            fd_dy = (alive_f[ci][1]-fy)/WORLD_H
-            fd_d  = min(df[ci]/(WORLD_W*.5), 1.0)
-        else:
-            fd_dx = fd_dy = 0.0; fd_d = 1.0
-
-        # ── Inputs prédateur ──────────────────────────────────────────────────
-        ddx = pred.x - fx; ddy = pred.y - fy
-        pd_dn = np.sqrt(ddx*ddx + ddy*ddy)
-        pd_dx = ddx/WORLD_W; pd_dy = ddy/WORLD_H
-        pd_d  = min(pd_dn/(WORLD_W*.5), 1.0)
-
-        # ── Murs ──────────────────────────────────────────────────────────────
-        wx = min(fx, WORLD_W-fx) / (WORLD_W*.5)
-        wy = min(fy, WORLD_H-fy) / (WORLD_H*.5)
-
-        # Pénalité bord : exponentielle avec la proximité réelle (pas binaire)
-        bx = max(0.0, 1.0 - min(fx, WORLD_W-fx)/BORDER_ZONE)
-        by = max(0.0, 1.0 - min(fy, WORLD_H-fy)/BORDER_ZONE)
-        border_pen += max(bx, by) ** 2
-
-        # ── Danger memory (décroît exponentiellement) ─────────────────────────
-        if pred_active and pd_dn < 250:
-            danger_memory = min(1.0, danger_memory + 0.20 * (1 - pd_d))
-        else:
-            danger_memory = max(0.0, danger_memory * 0.97)
-
-        # ── Urgence faim ──────────────────────────────────────────────────────
-        hunger_urgency = max(0.0, 1.0 - hunger * 2.5)   # monte fort sous 0.4
-        meal_signal    = ticks_since_meal / MEAL_SAT_TICKS  # 0=vient de manger, 1=longtemps
-
-        inp = np.array([
-            fd_dx, fd_dy, fd_d,
-            pd_dx, pd_dy, pd_d,
-            wx, wy,
-            vx/MAX_SPD, vy/MAX_SPD,
-            fear,
-            float(pred_active),
-            danger_memory,
-            hunger_urgency,
-            meal_signal,
-        ], dtype=np.float32)
-
-        out = brain.forward(inp)
-        ax  = (out[3] - out[2]) * FISH_SPD
-        ay  = (out[0] - out[1]) * FISH_SPD
-
-        # ── Répulsion mur (adoucie, mirroir exact JS) ─────────────────────────
-        ax += wall_repulse(fx, 5, WORLD_W-5)
-        ay += wall_repulse(fy, 5, WORLD_H-5)
-
-        # ── Réflexe panique ───────────────────────────────────────────────────
-        if pred_active and pd_dn < PANIC_DIST:
-            ax = (fx-pred.x)/max(pd_dn,1)*FISH_SPD*1.6
-            ay = (fy-pred.y)/max(pd_dn,1)*FISH_SPD*1.6
-
-        vx = vx*0.50 + ax*0.50
-        vy = vy*0.50 + ay*0.50
-        spd = np.sqrt(vx*vx+vy*vy)
-        if spd > MAX_SPD:
-            vx *= MAX_SPD/spd; vy *= MAX_SPD/spd
-
-        px, py = fx, fy
-        fx = float(np.clip(fx+vx, 5, WORLD_W-5))
-        fy = float(np.clip(fy+vy, 5, WORLD_H-5))
-        dist_tot += np.sqrt((fx-px)**2+(fy-py)**2)
-
-        # ── Manger ────────────────────────────────────────────────────────────
-        for f in foods:
-            if not f[2] and np.sqrt((fx-f[0])**2+(fy-f[1])**2) < 14:
-                f[2] = True; food_eaten += 1
-                hunger = min(1.0, hunger + HUNGER_GAIN)
-                meal_intervals.append(ticks_since_meal)
-                ticks_since_meal = 0.0
-                # Respawn anti-superposition (distance min avec autres nourritures)
-                for _try in range(8):
-                    nx = float(rng.uniform(20, WORLD_W-20))
-                    ny = float(rng.uniform(20, WORLD_H-20))
-                    ok = True
-                    for g in foods:
-                        if g is f or g[2]:
-                            continue
-                        if np.sqrt((nx-g[0])**2+(ny-g[1])**2) < 28:
-                            ok = False; break
-                    if ok:
-                        break
-                f[0] = nx; f[1] = ny; f[2] = False
-
-        # ── Prédateur step + mort ─────────────────────────────────────────────
-        pred.step([(fx, fy)], pred_active, rng)
-        if pred_active and np.sqrt((fx-pred.x)**2+(fy-pred.y)**2) < 18:
-            sr  = step / MAX_STEPS
-            fr  = food_eaten / max(step, 1) * 120
-            bp  = border_pen / max(step, 1)
-            fit = 0.08*sr + 0.86*min(fr,1.) - 0.06*bp
-            if food_eaten == 0:
-                fit *= 0.05
-            return max(fit, 0.0), food_eaten, step
-
-        # ── Peur ──────────────────────────────────────────────────────────────
-        if pred_active and pd_dn < 210:
-            fear = min(1.0, fear + 0.28*(1-pd_d))
-        else:
-            fear = max(0.0, fear - 0.04)
-
-    # Fin de vie (survie ou famine)
-    fr   = food_eaten / MAX_STEPS * 120
-    eff  = food_eaten / max(dist_tot, 1) * 600
-    bp   = border_pen / MAX_STEPS
-    # Bonus de régularité : moyenne des écarts entre repas, normalisée
-    if len(meal_intervals) >= 2:
-        avg_gap = float(np.mean(meal_intervals))
-        regularity = max(0.0, 1.0 - avg_gap / MEAL_SAT_TICKS)
+    # Peur
+    fear_gain = 0.28 * (1.4 - t['boldness']*0.8)
+    if is_pred_active and min_pd < 200:
+        fish.fear = min(1.0, fish.fear + fear_gain*(1-pd_dist))
     else:
-        regularity = 0.0
-    fit  = (0.70*min(fr,1.) + 0.12*min(eff,1.) + 0.08*regularity + 0.10)
-    fit -= 0.16*bp            # pénalité bord (exponentielle, beaucoup plus stricte)
-    if food_eaten == 0:
-        fit *= 0.05
-    if died_starvation:
-        fit *= 0.30            # mort de faim : forte pénalité
-    return max(fit, 0.0), food_eaten, MAX_STEPS
+        fish.fear = max(0.0, fish.fear - 0.04)
+    fish.fear_accum += fish.fear
+    fish.fear_avg    = fish.fear_accum / max(fish.steps_survived, 1)
 
+# ══════════════════════════════════════════════════════════════
+#  Reproduction — miroir de handleReproduction()
+# ══════════════════════════════════════════════════════════════
+def handle_reproduction(fishes: list, stats: dict, gen_counter: list, rng) -> list:
+    candidates = [f for f in fishes if f.alive and f.age > MATURITY_AGE
+                  and f.energy > REPRO_ENERGY and f.repro_cooldown <= 0]
+    if len(candidates) < 2: return []
 
-# ── Évaluation multi-seeds ────────────────────────────────────────────────────
+    paired = set(); new_fish = []
+    for i, a in enumerate(candidates):
+        if a.id in paired: continue
+        for b in candidates[i+1:]:
+            if b.id in paired: continue
+            if d(a.x,a.y,b.x,b.y) < REPRO_RANGE:
+                paired.add(a.id); paired.add(b.id)
+                cw = mutate_weights(crossover_weights(a.weights, b.weights, rng), rng)
+                ct = mutate_temperament(crossover_temperament(a.temperament, b.temperament, rng), rng)
+                child_gen = max(a.gen, b.gen) + 1
+                gen_counter[0] = max(gen_counter[0], child_gen)
 
-def _eval_worker(args):
-    """Worker pour multiprocessing."""
-    weights_list, ctx, base, ns = args
-    brain = MLP.from_list(weights_list)
-    np.random.seed(base % (2**31))  # évite les collisions de seed
-    fits = [run_sim(brain, ctx, base + k*1997)[0] for k in range(ns)]
-    return float(np.mean(fits))
+                a.energy -= REPRO_COST; b.energy -= REPRO_COST
+                a.repro_cooldown = REPRO_COOLDOWN; b.repro_cooldown = REPRO_COOLDOWN
+                a.children += 1; b.children += 1
 
-def evaluate(brain, ctx, base, ns=N_SEEDS):
-    return _eval_worker((brain.to_list(), ctx, base, ns))
+                cx = (a.x+b.x)/2 + (rng.random()-0.5)*10
+                cy = (a.y+b.y)/2 + (rng.random()-0.5)*10
+                child = make_fish(rng, gen=child_gen, weights=cw, temperament=ct,
+                                  x=cx, y=cy, energy=0.55, parents=(a.id, b.id))
+                new_fish.append(child)
+                stats['births'] += 1
+                break
+    return new_fish
 
+# ══════════════════════════════════════════════════════════════
+#  Simulation complète d'une population sur N ticks
+# ══════════════════════════════════════════════════════════════
+def run_simulation(sim_ticks: int, seed: int, verbose: bool = False) -> dict:
+    global _next_id
+    _next_id = 1
+    rng = np.random.default_rng(seed)
 
-# ── Évolution d'une lignée ────────────────────────────────────────────────────
+    fishes: List[Fish] = [make_fish(rng) for _ in range(START_POP)]
+    foods:  List[Food] = []
+    for _ in range(N_FOOD):
+        f = Food(0,0)
+        place_food_no_overlap(f, foods, rng)
+        foods.append(f)
 
-def evolve(name, ctx, n_gen=N_GENERATIONS, pop_size=POP_SIZE):
-    print(f"\n[{name}] {ctx['desc']}")
-    pop = [MLP() for _ in range(pop_size)]
-    std = MUT_INIT; best_brain = pop[0]; best_fit = -1.0; hist = []; stag = 0
+    pred = Predator(x=W*0.85, y=H*0.5, cooldown=120+rng.random()*100)
+    preds = [pred]
 
-    for gen in range(n_gen):
-        # Évaluation (parallèle si possible)
-        args = [(b.to_list(), ctx, gen*pop_size+i, N_SEEDS) for i,b in enumerate(pop)]
-        try:
-            n_proc = min(cpu_count(), 4)
-            with Pool(n_proc) as pool:
-                fit_vals = pool.map(_eval_worker, args)
-        except Exception:
-            fit_vals = [_eval_worker(a) for a in args]
+    stats = {'births':0, 'deaths':{'starvation':0,'predator':0,'old_age':0}}
+    gen_counter = [0]
+    pop_history: List[Dict] = []
 
-        scores = sorted(zip(fit_vals, pop), key=lambda x: x[0], reverse=True)
-        gf, gb = scores[0]
-        avg = float(np.mean([s[0] for s in scores]))
+    for tick in range(1, sim_ticks+1):
+        alive_fishes = [f for f in fishes if f.alive]
+        pop = len(alive_fishes)
 
-        if gf > best_fit + 1e-4:
-            best_fit = gf; best_brain = gb; stag = 0
-        else:
-            stag += 1
+        # Respawn nourriture
+        resp_p = FOOD_RESPAWN_BASE * (ECO_K / (ECO_K + pop))
+        for f in foods:
+            if f.eaten and rng.random() < resp_p:
+                place_food_no_overlap(f, foods, rng)
+                f.eaten = False
 
-        # Mutation adaptative
-        if stag >= STAG_WINDOW:
-            std = min(std*1.65, MUT_MAX); stag = 0
-            print(f"    ↑ σ={std:.3f} (stagnation)")
-        else:
-            std = max(std*0.91, MUT_MIN)
+        # Prédateur
+        step_predator(pred, alive_fishes, rng)
 
-        _, food_log, steps_log = run_sim(gb, ctx, 42)
-        hist.append({"gen": gen, "best": round(gf,4), "avg": round(avg,4),
-                     "food": food_log, "steps": steps_log, "sigma": round(std,4)})
-        print(f"  Gen {gen+1:02d} | fit={gf:.4f} avg={avg:.4f} food={food_log} "
-              f"steps={steps_log} σ={std:.3f}")
+        # Poissons
+        for fish in fishes:
+            if fish.alive:
+                step_fish(fish, alive_fishes, foods, preds, rng)
 
-        # Sélection + reproduction
-        elites = [b for _,b in scores[:ELITE_K]]
-        new_pop = list(elites)
-        fv = np.array([scores[i][0] for i in range(ELITE_K)])
-        fv = np.maximum(fv, 1e-6)
-        p  = fv / fv.sum()
-        while len(new_pop) < pop_size:
-            i1, i2 = np.random.choice(ELITE_K, 2, replace=False, p=p)
-            new_pop.append(elites[i1].crossover(elites[i2]).mutate(std))
-        pop = new_pop
+        # Reproduction
+        new_fish = handle_reproduction(fishes, stats, gen_counter, rng)
+        fishes.extend(new_fish)
 
+        # Vieillesse
+        for fish in fishes:
+            if fish.alive and fish.age > MAX_AGE:
+                p = OLD_AGE_DEATH * (1 + (fish.age-MAX_AGE)/MAX_AGE)
+                if rng.random() < p:
+                    fish.alive = False; fish.death_cause = 'old_age'
+                    stats['deaths']['old_age'] += 1
+
+        # Anti-extinction
+        still_alive = sum(1 for f in fishes if f.alive)
+        if still_alive < MIN_POP:
+            fishes.append(make_fish(rng, gen=gen_counter[0]))
+            stats['births'] += 1
+
+        # Nettoyage
+        if len(fishes) > 60:
+            alive_l  = [f for f in fishes if f.alive]
+            dead_l   = [f for f in fishes if not f.alive][-20:]
+            fishes   = alive_l + dead_l
+
+        # Historique
+        if tick % 50 == 0:
+            alive_l = [f for f in fishes if f.alive]
+            avg_e   = sum(f.energy for f in alive_l)/max(len(alive_l),1)
+            avg_gen = sum(f.gen    for f in alive_l)/max(len(alive_l),1)
+            avg_t   = {k: sum(f.temperament[k] for f in alive_l)/max(len(alive_l),1)
+                       for k in TEMP_KEYS}
+            pop_history.append({'tick':tick,'pop':len(alive_l),'avgEnergy':avg_e,
+                                 'avgGen':avg_gen,'avgTemp':avg_t})
+            if verbose and tick % 500 == 0:
+                print(f"  tick {tick:5d} | pop={len(alive_l):3d} gen={avg_gen:.1f} "
+                      f"energy={avg_e:.2f} | "
+                      f"perc={avg_t['perception']:.2f} metab={avg_t['metabolism']:.2f} "
+                      f"soc={avg_t['socialPull']:.2f} bold={avg_t['boldness']:.2f}")
+
+    alive_l = [f for f in fishes if f.alive]
     return {
-        "name": name, "color": ctx["color"], "desc": ctx["desc"],
-        "context": ctx, "final_fitness": round(best_fit,4),
-        "weights": best_brain.to_list(), "history": hist,
-        "arch": {"input": INPUT_SIZE, "hidden": HIDDEN_SIZE, "output": OUTPUT_SIZE},
+        'seed':          seed,
+        'final_pop':     len(alive_l),
+        'max_gen':       gen_counter[0],
+        'births':        stats['births'],
+        'deaths':        stats['deaths'],
+        'pop_history':   pop_history,
+        'final_avg_temp': {k: sum(f.temperament[k] for f in alive_l)/max(len(alive_l),1)
+                           for k in TEMP_KEYS} if alive_l else {},
+        'final_avg_energy': sum(f.energy for f in alive_l)/max(len(alive_l),1),
     }
 
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════
+#  Main
+# ══════════════════════════════════════════════════════════════
 def main():
-    np.random.seed(42); random.seed(42)
-    results = {}
-    for name, ctx in LINEAGE_CONTEXTS.items():
-        results[name] = evolve(name, ctx)
+    parser = argparse.ArgumentParser(description='Aquarium Evolution — analyse headless')
+    parser.add_argument('--ticks', type=int, default=4000,  help='Ticks par run (défaut 4000)')
+    parser.add_argument('--runs',  type=int, default=2,     help='Nombre de runs indépendants (défaut 2)')
+    parser.add_argument('--seed',  type=int, default=42,    help='Seed du premier run')
+    parser.add_argument('--json',  type=str, default=None,  help='Exporter les stats dans un fichier JSON')
+    args = parser.parse_args()
 
-    out = {
-        "world":    {"w": WORLD_W, "h": WORLD_H},
-        "lineages": results,
-        "arch":     {"input": INPUT_SIZE, "hidden": HIDDEN_SIZE, "output": OUTPUT_SIZE},
-    }
-    with open("lineages.json","w") as f:
-        json.dump(out, f, indent=2)
-    print("\n✓ lineages.json")
-    for n,d in results.items():
-        print(f"  {n}: {d['final_fitness']:.4f}")
+    print(f"Aquarium Evolution v6 — {args.runs} run(s) × {args.ticks} ticks")
+    print(f"Architecture MLP : {INPUT_SIZE}→{HIDDEN_SIZE}→{OUTPUT_SIZE} ({N_WEIGHTS} poids)")
+    print(f"Tempérament : {list(TEMP_KEYS)}\n")
 
-if __name__ == "__main__":
+    all_results = []
+    for run_i in range(args.runs):
+        seed = args.seed + run_i * 1337
+        print(f"── Run {run_i+1}/{args.runs} (seed={seed}) {'─'*40}")
+        result = run_simulation(args.ticks, seed=seed, verbose=True)
+        all_results.append(result)
+        ft = result['final_avg_temp']
+        print(f"\n  → pop finale : {result['final_pop']} | "
+              f"max génération : {result['max_gen']} | naissances : {result['births']}")
+        print(f"     morts : faim={result['deaths']['starvation']} "
+              f"prédateur={result['deaths']['predator']} vieillesse={result['deaths']['old_age']}")
+        if ft:
+            label = temperament_label(ft)
+            print(f"     tempérament dominant : {label}")
+            print(f"     → perception={ft['perception']:.3f}  "
+                  f"metabolism={ft['metabolism']:.3f}  "
+                  f"socialPull={ft['socialPull']:.3f}  "
+                  f"boldness={ft['boldness']:.3f}")
+
+    # Convergence inter-runs
+    if args.runs > 1 and all(r['final_avg_temp'] for r in all_results):
+        print(f"\n{'─'*55}")
+        print("Convergence inter-runs (variance du tempérament final) :")
+        for k in TEMP_KEYS:
+            vals = [r['final_avg_temp'][k] for r in all_results]
+            print(f"  {k:12s}: mean={np.mean(vals):.3f}  std={np.std(vals):.3f}")
+
+    if args.json:
+        with open(args.json, 'w') as f:
+            json.dump(all_results, f, indent=2)
+        print(f"\n✓ Stats exportées → {args.json}")
+
+if __name__ == '__main__':
     main()

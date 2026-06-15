@@ -1,37 +1,99 @@
 // ══════════════════════════════════════════════════════════════
-//  CONSTANTES (miroir exact du Python)
+//  AQUARIUM ÉVOLUTIF v6 — Neuroévolution en direct
 // ══════════════════════════════════════════════════════════════
-const INPUT_SIZE  = 15;
+//
+// Changement de paradigme vs v5 :
+//  - Plus de "5 lignées" pré-entraînées hors-ligne. Chaque poisson
+//    a son PROPRE génome (poids MLP + vecteur de tempérament),
+//    hérité et muté à la reproduction. Tout évolue EN DIRECT,
+//    dans le navigateur, à partir de poids aléatoires.
+//  - Reproduction sexuée : deux poissons matures, proches, et bien
+//    nourris produisent un enfant (crossover + mutation des deux
+//    génomes parents).
+//  - Régulation écologique douce : le taux de respawn de nourriture
+//    diminue quand la population est dense → pression de sélection
+//    naturelle sans plafond dur.
+//  - Input social (16e) : direction/densité du groupe de voisins,
+//    pondérée par le trait de tempérament "socialPull".
+//
+// evolution.py n'est plus un prérequis : c'est un outil d'analyse
+// headless optionnel (statistiques de convergence sur plusieurs runs).
+//
+// ══════════════════════════════════════════════════════════════
+//  CONSTANTES DU MONDE
+// ══════════════════════════════════════════════════════════════
+const INPUT_SIZE  = 16;
 const HIDDEN_SIZE = 18;
 const OUTPUT_SIZE = 4;
 const W = 800, H = 600;
 const MAX_SPD   = 3.2;
 const FISH_SPD  = 3.0;
-const PANIC_DIST = 100;
+const PANIC_DIST_BASE = 100;
 const FOOD_R = 11, PRED_R = 16, FISH_R = 9;
-const HUNGER_DEC  = 1.0 / (2500 * 0.75);
-const HUNGER_GAIN = 0.40;
 const BORDER_ZONE = 80;
-const WALL_FORCE  = 2.6;   // mirroir exact Python (était 5.5 — beaucoup trop fort)
-const WALL_EXP    = 1.6;   // mirroir exact Python (était 2.2)
+const WALL_FORCE  = 2.6;
+const WALL_EXP    = 1.6;
 const MEAL_SAT_TICKS = 400.0;
-const FOOD_MIN_DIST = 28;  // anti-superposition nourriture
-const N_FOOD_BASE = 22;
-const AGGRO_R = 230, ABANDON_R = 290, MAX_CHASE_TICKS = 220;
-// Nombre de nourritures par contexte de lignée (mirroir exact Python)
-const FOOD_COUNT_BY_CONTEXT = { rich: 32, normal: N_FOOD_BASE, sparse: 10 };
+const FOOD_MIN_DIST = 28;
+
+// ── Écologie / population ───────────────────────────────────────
+const N_FOOD        = 34;             // pool de nourriture global, fixe
+const FOOD_RESPAWN_BASE = 0.045;      // proba de respawn d'une unité mangée, par tick, à population nulle
+const ECO_K         = 9;              // densité de population "de référence" pour la régularisation
+const HUNGER_GAIN   = 0.40;
+
+// ── Cycle de vie ─────────────────────────────────────────────────
+const START_POP      = 9;
+const MIN_POP        = 3;     // si on tombe sous ce seuil, on réintroduit un individu (évite extinction totale)
+const MATURITY_AGE   = 600;   // ticks avant de pouvoir se reproduire
+const REPRO_ENERGY   = 0.72;  // énergie minimale pour se reproduire
+const REPRO_COST     = 0.30;  // énergie perdue par parent à la reproduction
+const REPRO_COOLDOWN = 500;   // ticks avant de pouvoir se reproduire à nouveau
+const REPRO_RANGE    = 42;    // distance max entre 2 parents
+const MAX_AGE        = 9000;  // au-delà, probabilité de mort naturelle croissante
+const OLD_AGE_DEATH_RATE = 0.0006; // proba/tick de mort naturelle au-delà de MAX_AGE
+
+// ── Génétique ─────────────────────────────────────────────────────
+const MUT_STD       = 0.12;
+const MUT_BIG_PROB  = 0.05;
+const MUT_BIG_MULT  = 3.0;
+const TEMPERAMENT_MUT_STD = 0.06;
 
 // ══════════════════════════════════════════════════════════════
-//  MLP — miroir exact
+//  MLP
 // ══════════════════════════════════════════════════════════════
+const N_W1 = INPUT_SIZE * HIDDEN_SIZE;
+const N_B1 = HIDDEN_SIZE;
+const N_W2 = HIDDEN_SIZE * OUTPUT_SIZE;
+const N_B2 = OUTPUT_SIZE;
+const N_WEIGHTS = N_W1 + N_B1 + N_W2 + N_B2;
+
+function randomWeights() {
+  const s1 = Math.sqrt(2.0/(INPUT_SIZE+HIDDEN_SIZE));
+  const s2 = Math.sqrt(2.0/(HIDDEN_SIZE+OUTPUT_SIZE));
+  const w = new Float64Array(N_WEIGHTS);
+  let idx=0;
+  for (let i=0;i<N_W1;i++) w[idx++] = gaussian()*s1;
+  for (let i=0;i<N_B1;i++) w[idx++] = 0;
+  for (let i=0;i<N_W2;i++) w[idx++] = gaussian()*s2;
+  for (let i=0;i<N_B2;i++) w[idx++] = 0;
+  return w;
+}
+
+function gaussian() {
+  // Box-Muller
+  let u=0,v=0;
+  while(u===0) u=Math.random();
+  while(v===0) v=Math.random();
+  return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+}
+
 function mlpForward(weights, x) {
   let idx = 0;
-  const nW1 = INPUT_SIZE * HIDDEN_SIZE;
-  const W1 = weights.slice(idx, idx+nW1); idx += nW1;
-  const b1 = weights.slice(idx, idx+HIDDEN_SIZE); idx += HIDDEN_SIZE;
-  const nW2 = HIDDEN_SIZE * OUTPUT_SIZE;
-  const W2 = weights.slice(idx, idx+nW2); idx += nW2;
-  const b2 = weights.slice(idx, idx+OUTPUT_SIZE);
+  const W1 = weights.subarray(idx, idx+N_W1); idx += N_W1;
+  const b1 = weights.subarray(idx, idx+N_B1); idx += N_B1;
+  const W2 = weights.subarray(idx, idx+N_W2); idx += N_W2;
+  const b2 = weights.subarray(idx, idx+N_B2);
 
   const h = new Float64Array(HIDDEN_SIZE);
   for (let j = 0; j < HIDDEN_SIZE; j++) {
@@ -48,13 +110,105 @@ function mlpForward(weights, x) {
   return out;
 }
 
+// Crossover BLX-alpha entre deux vecteurs de poids
+function crossoverWeights(wa, wb) {
+  const a = 0.25 + Math.random()*0.5; // a in [0.25, 0.75]
+  const out = new Float64Array(N_WEIGHTS);
+  for (let i=0;i<N_WEIGHTS;i++) out[i] = a*wa[i] + (1-a)*wb[i];
+  return out;
+}
+
+function mutateWeights(w, std) {
+  const out = new Float64Array(N_WEIGHTS);
+  for (let i=0;i<N_WEIGHTS;i++) {
+    let n = gaussian()*std;
+    if (Math.random() < MUT_BIG_PROB) n *= MUT_BIG_MULT;
+    out[i] = w[i] + n;
+  }
+  return out;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  TEMPÉRAMENT — vecteur hérité de traits comportementaux
+// ══════════════════════════════════════════════════════════════
+// Chaque trait dans [0,1]. Modulent à la fois les INPUTS perçus par
+// le réseau (perception, social) et la PHYSIQUE du poisson
+// (métabolisme, hardiesse) — donc même un réseau identique peut
+// produire un comportement différent selon le tempérament porté.
+//
+//  perception : 0 = myope (bruit de capteur fort sur nourriture/prédateur)
+//               1 = clairvoyant (perception quasi exacte)
+//  metabolism : 0 = lent/économe (faim baisse lentement, vitesse -10%)
+//               1 = rapide/glouton (faim baisse vite, vitesse +10%,
+//                   mais gain de nourriture légèrement supérieur)
+//  socialPull : 0 = solitaire (ignore le groupe)
+//               1 = grégaire (fortement attiré par le centroïde des voisins)
+//  boldness   : 0 = anxieux (peur monte plus vite, panique de plus loin)
+//               1 = téméraire (peur monte lentement, panique seulement
+//                   au dernier moment — plus risqué près du prédateur)
+
+function randomTemperament() {
+  return {
+    perception: Math.random(),
+    metabolism: Math.random(),
+    socialPull: Math.random(),
+    boldness:   Math.random(),
+  };
+}
+
+function crossoverTemperament(ta, tb) {
+  const out = {};
+  for (const k of Object.keys(ta)) {
+    const a = Math.random();
+    out[k] = clamp01(a*ta[k] + (1-a)*tb[k]);
+  }
+  return out;
+}
+
+function mutateTemperament(t) {
+  const out = {};
+  for (const k of Object.keys(t)) {
+    out[k] = clamp01(t[k] + gaussian()*TEMPERAMENT_MUT_STD);
+  }
+  return out;
+}
+
+function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+
+// Couleur dérivée du tempérament — pour identifier visuellement les
+// "espèces"/profils émergents sans avoir de lignées figées.
+// Teinte = perception (bleu froid = myope, jaune chaud = clairvoyant)
+// Saturation = boldness, Luminosité = socialPull (offset léger)
+function temperamentColor(t) {
+  const hue = 200 - t.perception*180;       // 200° (bleu) → 20° (orange)
+  const sat = 45 + t.boldness*45;           // 45–90%
+  const light = 48 + (t.socialPull-0.5)*14; // 41–55%
+  return `hsl(${hue.toFixed(0)} ${sat.toFixed(0)}% ${light.toFixed(0)}%)`;
+}
+
+function temperamentLabel(t) {
+  // Étiquette descriptive courte du profil dominant
+  const tags = [];
+  tags.push(t.perception < 0.35 ? 'myope' : t.perception > 0.65 ? 'clairvoyant' : null);
+  tags.push(t.metabolism < 0.35 ? 'économe' : t.metabolism > 0.65 ? 'glouton' : null);
+  tags.push(t.socialPull < 0.35 ? 'solitaire' : t.socialPull > 0.65 ? 'grégaire' : null);
+  tags.push(t.boldness   < 0.35 ? 'anxieux'   : t.boldness   > 0.65 ? 'téméraire' : null);
+  const present = tags.filter(Boolean);
+  return present.length ? present.join(' · ') : 'équilibré';
+}
+
 // ══════════════════════════════════════════════════════════════
 //  État global
 // ══════════════════════════════════════════════════════════════
-let lineageData = null;
 let fishes = [], foods = [], preds = [];
 let tick = 0, paused = false, speed = 1;
 let hoveredFish = null;
+let nextFishId = 1;
+let genCounter = 0;       // génération max atteinte (profondeur d'arbre généalogique)
+let stats = {
+  births: 0, deaths: { starvation:0, predator:0, old_age:0 },
+  popHistory: [], // {tick, pop, avgEnergy, avgGen}
+};
 let lastInsightUpdate = 0;
 
 const canvas = document.getElementById('aquarium');
@@ -69,180 +223,84 @@ function resizeCanvas() {
 function dist(x1,y1,x2,y2) { return Math.hypot(x2-x1, y2-y1); }
 
 // ══════════════════════════════════════════════════════════════
-//  Interprétation comportementale (dashboard)
-// ══════════════════════════════════════════════════════════════
-function behaviourInsight(fish) {
-  // Calcul de métriques comportementales
-  const alive         = fish.alive;
-  const fe            = fish.foodEaten;
-  const steps         = fish.stepsSurvived;
-  const hunger        = fish.hunger;
-  const fear          = fish.fearAvg;
-  const deathCause    = fish.deathCause;
-  const foodPerTick   = fe / Math.max(steps, 1);
-  const context       = fish.context;
-
-  if (!alive) {
-    if (deathCause === 'starvation') {
-      if (fe === 0)
-        return "⚠ N'a pas compris que ne pas manger entraîne la mort.";
-      if (fear > 0.35)
-        return "La peur du prédateur a paralysé la recherche de nourriture.";
-      return "A mangé, mais trop rarement — épuisement progressif.";
-    }
-    if (deathCause === 'predator') {
-      if (fe === 0)
-        return "Tué sans avoir mangé — les neurones n'ont pas encore de stratégie.";
-      if (steps < 200)
-        return "Mort tôt : pas eu le temps d'apprendre la fuite.";
-      return `A survécu ${steps} ticks avant d'être attrapé. Progression réelle.`;
-    }
-  }
-
-  // Vivant — analyse du comportement en cours
-  if (steps < 100) return "Neurones en phase d'exploration initiale.";
-
-  // Régularité alimentaire : le réseau a-t-il appris à anticiper la faim
-  // plutôt que d'attendre l'urgence ?
-  if (fish.mealIntervals && fish.mealIntervals.length >= 4) {
-    const avgGap = fish.mealIntervals.reduce((a,b)=>a+b,0)/fish.mealIntervals.length;
-    if (avgGap < 120 && fear < 0.3)
-      return "✓ Rythme alimentaire régulier appris — la pression de faim ne monte presque jamais.";
-    if (avgGap > 300)
-      return "Repas trop espacés — la faim grimpe dangereusement entre deux prises.";
-  }
-
-  if (foodPerTick > 0.015 && fear < 0.2)
-    return "✓ Excellente stratégie : mange efficacement, peu de peur inutile.";
-  if (foodPerTick > 0.015 && fear > 0.4)
-    return "Mange bien malgré la peur — bonne gestion du risque.";
-  if (foodPerTick < 0.003 && fear > 0.4)
-    return "Paralysé par la peur — survie passive, mais la faim arrive.";
-  if (foodPerTick < 0.003 && hunger < 0.5)
-    return "⚠ Faim critique — urgence nourriture pas encore comprise.";
-  if (fe > 8 && context && context.food === 'sparse')
-    return "✓ Adapté aux milieux pauvres : trouve la nourriture rare efficacement.";
-  if (fe > 12)
-    return "✓ Stratégie alimentaire optimisée, longues séquences de chasse.";
-  if (hunger > 0.7 && fe > 3)
-    return "Bon équilibre survie/nourriture — modèle viable.";
-
-  return "Comportement stable, en cours d'optimisation.";
-}
-
-function behaviourTags(lin) {
-  const c = lin.context;
-  const tags = [];
-  if (!c) return tags;
-  if (c.pred_aggro >= 2.2) tags.push({text:'PRESSION HAUTE', color:'#e74c3c'});
-  else if (c.pred_aggro <= 1.0) tags.push({text:'ENV. SAFE', color:'#2ecc71'});
-  if (c.food === 'rich')   tags.push({text:'NOURRITURE ABONDANTE', color:'#f39c12'});
-  if (c.food === 'sparse') tags.push({text:'NOURRITURE RARE', color:'#e67e22'});
-  return tags;
-}
-
-// ══════════════════════════════════════════════════════════════
-//  Spawn world — TOUS les objets correctement initialisés
+//  Nourriture — anti-superposition
 // ══════════════════════════════════════════════════════════════
 function makeFoodItem(pool) {
   const f = {
-    x: 0, y: 0,
-    eaten: false,
+    x:0, y:0, eaten:false,
     phase: Math.random()*Math.PI*2,
     size:  0.8 + Math.random()*0.5,
-    type:  Math.floor(Math.random()*3),  // 0=pellet 1=algue 2=plancton
+    type:  Math.floor(Math.random()*3),
   };
   placeFoodNoOverlap(f, pool || []);
   return f;
 }
-
-// Replace food coordinates with a position that respects a minimum
-// distance from other (non-eaten) food in the same pool — avoids the
-// "stacked algae" visual mess.
 function placeFoodNoOverlap(f, pool) {
-  for (let tries = 0; tries < 8; tries++) {
+  for (let tries=0; tries<8; tries++) {
     const nx = 30 + Math.random()*(W-60);
     const ny = 30 + Math.random()*(H-100);
     let ok = true;
-    for (let i = 0; i < pool.length; i++) {
+    for (let i=0;i<pool.length;i++) {
       const g = pool[i];
-      if (g === f || g.eaten) continue;
-      if (dist(nx,ny,g.x,g.y) < FOOD_MIN_DIST) { ok = false; break; }
+      if (g===f || g.eaten) continue;
+      if (dist(nx,ny,g.x,g.y) < FOOD_MIN_DIST) { ok=false; break; }
     }
-    if (ok) { f.x = nx; f.y = ny; return; }
-    if (tries === 7) { f.x = nx; f.y = ny; } // dernier essai : on accepte
+    if (ok || tries===7) { f.x=nx; f.y=ny; return; }
   }
 }
 
-function spawnWorld() {
-  if (!lineageData) return;
-  fishes = []; foods = []; preds = []; tick = 0;
-
-  const names = Object.keys(lineageData.lineages);
-  names.forEach((name, i) => {
-    const lin   = lineageData.lineages[name];
-    const angle = (i/names.length)*Math.PI*2;
-    const r     = Math.min(W,H)*0.28;
-
-    // Pool de nourriture propre à cette lignée (mirroir exact entraînement)
-    const foodCtx   = (lin.context && lin.context.food) || 'normal';
-    const nFood     = FOOD_COUNT_BY_CONTEXT[foodCtx] !== undefined ? FOOD_COUNT_BY_CONTEXT[foodCtx] : N_FOOD_BASE;
-    const foodPool  = [];
-    for (let k = 0; k < nFood; k++) foodPool.push(makeFoodItem(foodPool));
-
-    fishes.push({
-      name, color:lin.color,
-      // Poids : doit être un Array plat pour slicing dans mlpForward
-      weights: Array.isArray(lin.weights) ? lin.weights : Array.from(lin.weights),
-      x: W/2 + Math.cos(angle)*r,
-      y: H/2 + Math.sin(angle)*r,
-      vx:0, vy:0,
-      angle: angle+Math.PI,
-      tailPhase: Math.random()*Math.PI*2,
-      tailAmp:   0.2,
-      trail:     [],
-      alive:     true,
-      foodEaten: 0,
-      stepsSurvived: 0,
-      distanceTraveled: 0,
-      hunger:    1.0,
-      fear:      0.0,
-      fearAccum: 0.0,
-      fearAvg:   0.0,
-      dangerMem: 0.0,
-      timeSinceMeal: MEAL_SAT_TICKS,   // ← nouveau : pour input "meal_signal"
-      mealIntervals: [],               // ← historique pour insight régularité
-      deathCause: null,
-      finalFitness: lin.final_fitness,
-      context: lin.context,
-      history: lin.history,
-      insight: '',
-      foodPool,                         // pool de nourriture propre à cette lignée
-    });
-
-    // Le pool global "foods" reste utilisé par le rendu (drawFood itère tous les pools)
-    foods.push(...foodPool);
-  });
-
-  // Prédateur unique, mais capable de cibler n'importe quel poisson vivant
-  // et d'adapter sa vitesse au contexte (pred_aggro) de SA cible actuelle —
-  // mirroir fidèle de l'entraînement (chaque lignée affronte un prédateur
-  // dont la vitesse correspond à pred_aggro de SON propre contexte).
-  preds.push({
-    x: W*0.85, y: H*0.5,
+// ══════════════════════════════════════════════════════════════
+//  Genèse d'un poisson
+// ══════════════════════════════════════════════════════════════
+function makeFish(opts) {
+  const t = opts.temperament || randomTemperament();
+  return {
+    id: nextFishId++,
+    gen: opts.gen || 0,
+    weights: opts.weights || randomWeights(),
+    temperament: t,
+    color: temperamentColor(t),
+    x: opts.x !== undefined ? opts.x : 60+Math.random()*(W-120),
+    y: opts.y !== undefined ? opts.y : 60+Math.random()*(H-120),
     vx:0, vy:0,
-    angle: Math.PI,
-    active: false,
-    onTimer: 0,
-    cooldown: 120 + Math.random()*100,
-    mode: 'rôde',
-    chaseTicks: 0,
-    ambushTicks: 0,
-    ambushX: W/2, ambushY: H/2,
-    prevTx: null, prevTy: null,
-    tailPhase: 0,
-    speed: 1.8,           // valeur par défaut, réajustée dynamiquement chaque tick
-    target: null,         // référence au poisson actuellement visé
+    angle: Math.random()*Math.PI*2,
+    tailPhase: Math.random()*Math.PI*2,
+    tailAmp: 0.2,
+    trail: [],
+    alive: true,
+    age: 0,
+    energy: opts.energy !== undefined ? opts.energy : 1.0,
+    foodEaten: 0,
+    stepsSurvived: 0,
+    distanceTraveled: 0,
+    fear: 0, fearAccum: 0, fearAvg: 0,
+    dangerMem: 0,
+    timeSinceMeal: MEAL_SAT_TICKS*0.4,
+    mealIntervals: [],
+    reproCooldown: opts.reproCooldown || MATURITY_AGE*0.3,
+    children: 0,
+    deathCause: null,
+    parents: opts.parents || null,
+  };
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Spawn world
+// ══════════════════════════════════════════════════════════════
+function spawnWorld() {
+  fishes = []; foods = []; preds = []; tick = 0; genCounter = 0;
+  nextFishId = 1;
+  stats = { births:0, deaths:{starvation:0,predator:0,old_age:0}, popHistory:[] };
+
+  for (let i=0;i<START_POP;i++) fishes.push(makeFish({}));
+  for (let i=0;i<N_FOOD;i++) foods.push(makeFoodItem(foods));
+
+  preds.push({
+    x: W*0.85, y: H*0.5, vx:0, vy:0, angle: Math.PI,
+    active:false, onTimer:0, cooldown: 120+Math.random()*100,
+    mode:'rôde', chaseTicks:0, ambushTicks:0,
+    ambushX:W/2, ambushY:H/2, prevTx:null, prevTy:null,
+    tailPhase:0, speed:1.6, target:null,
   });
 }
 
@@ -252,304 +310,482 @@ function spawnWorld() {
 function simStep() {
   tick++;
   const aliveFishes = fishes.filter(f => f.alive);
+  const pop = aliveFishes.length;
 
-  // ── Prédateur ─────────────────────────────────────────────────────────────
-  preds.forEach(pred => {
-    pred.tailPhase += pred.active ? 0.18 : 0.06;
-
-    if (pred.active) {
-      pred.onTimer--;
-      if (pred.onTimer <= 0) {
-        pred.active = false;
-        pred.cooldown = 280 + Math.random()*200;
-        pred.mode = 'rôde';
-        pred.chaseTicks = 0;
-        pred.prevTx = pred.prevTy = null;
-      }
-    } else {
-      pred.cooldown--;
-      if (pred.cooldown <= 0) {
-        pred.active   = true;
-        pred.onTimer  = 160 + Math.random()*100;
-        pred.chaseTicks = pred.ambushTicks = 0;
-        pred.prevTx = pred.prevTy = null;
-        pred.mode = 'rôde';
-        // Spawn depuis un bord
-        const side = Math.floor(Math.random()*4);
-        if      (side===0) { pred.x=8;       pred.y=60+Math.random()*(H-120); }
-        else if (side===1) { pred.x=W-8;     pred.y=60+Math.random()*(H-120); }
-        else if (side===2) { pred.x=60+Math.random()*(W-120); pred.y=8; }
-        else               { pred.x=60+Math.random()*(W-120); pred.y=H-8; }
-        pred.vx = pred.vy = 0;
-      }
+  // ── Régulation écologique : respawn de nourriture modulé par densité ──
+  const respawnP = FOOD_RESPAWN_BASE * (ECO_K / (ECO_K + pop));
+  foods.forEach(f => {
+    if (f.eaten && Math.random() < respawnP) {
+      placeFoodNoOverlap(f, foods);
+      f.eaten = false;
+      f.phase = Math.random()*Math.PI*2;
+      f.type = Math.floor(Math.random()*3);
     }
-
-    if (!pred.active || aliveFishes.length === 0) {
-      // Dérive passive vers le centre
-      pred.vx = pred.vx*0.93 + (W/2-pred.x)/W*0.5 + (Math.random()-0.5)*0.6;
-      pred.vy = pred.vy*0.93 + (H/2-pred.y)/H*0.5 + (Math.random()-0.5)*0.6;
-      pred.mode = 'rôde';
-      pred.x = Math.max(5, Math.min(W-5, pred.x + pred.vx));
-      pred.y = Math.max(5, Math.min(H-5, pred.y + pred.vy));
-      if (Math.hypot(pred.vx, pred.vy) > 0.05) pred.angle = Math.atan2(pred.vy, pred.vx);
-      return;
-    }
-
-    // Cible : la plus proche, avec un peu d'hystérésis pour éviter les
-    // changements de cible erratiques (mirroir de la règle d'abandon
-    // d'entraînement : on ne change de cible que si une proie est
-    // significativement plus proche que la cible actuelle).
-    let nearest = null, minD = Infinity;
-    aliveFishes.forEach(f => {
-      const d = dist(pred.x, pred.y, f.x, f.y);
-      if (d < minD) { minD = d; nearest = f; }
-    });
-    if (!nearest) return;
-
-    let target = pred.target && pred.target.alive ? pred.target : null;
-    if (!target) {
-      target = nearest;
-      pred.prevTx = pred.prevTy = null;
-    } else {
-      const dCur = dist(pred.x, pred.y, target.x, target.y);
-      if (nearest !== target && dist(pred.x,pred.y,nearest.x,nearest.y) < dCur*0.6) {
-        target = nearest;
-        pred.prevTx = pred.prevTy = null;
-      } else {
-        minD = dCur;
-      }
-    }
-    pred.target = target;
-
-    // Vitesse adaptée au pred_aggro de la lignée actuellement ciblée
-    // (mirroir exact de l'entraînement : chaque lignée a appris contre
-    // un prédateur à SA vitesse). Lissé pour éviter les sauts brusques.
-    const targetAggro = (target.context && target.context.pred_aggro) || 1.6;
-    pred.speed = pred.speed*0.9 + targetAggro*0.1;
-
-    if (minD < AGGRO_R) {
-      // ── CHASSE ──
-      pred.mode = 'chasse';
-      pred.chaseTicks++;
-      pred.ambushTicks = 0;
-
-      let tx = target.x, ty = target.y;
-      if (pred.prevTx !== null) {
-        const h = Math.min(minD / Math.max(pred.speed*1.5, 0.1), 18);
-        tx += (tx - pred.prevTx)*h;
-        ty += (ty - pred.prevTy)*h;
-        tx = Math.max(5, Math.min(W-5, tx));
-        ty = Math.max(5, Math.min(H-5, ty));
-      }
-      pred.prevTx = target.x;
-      pred.prevTy = target.y;
-
-      const dx = tx-pred.x, dy = ty-pred.y;
-      const dn = Math.max(Math.hypot(dx,dy), 1);
-      pred.vx = pred.vx*0.50 + (dx/dn)*pred.speed*0.50;
-      pred.vy = pred.vy*0.50 + (dy/dn)*pred.speed*0.50;
-
-      if (minD > ABANDON_R || pred.chaseTicks > MAX_CHASE_TICKS) {
-        pred.mode = 'embuscade';
-        pred.chaseTicks = 0;
-        pred.prevTx = pred.prevTy = null;
-        // Point d'embuscade : mi-chemin vers le centroïde
-        const pcx = aliveFishes.reduce((s,f)=>s+f.x, 0)/aliveFishes.length;
-        const pcy = aliveFishes.reduce((s,f)=>s+f.y, 0)/aliveFishes.length;
-        pred.ambushX = (pred.x + pcx)/2;
-        pred.ambushY = (pred.y + pcy)/2;
-        pred.ambushTicks = 0;
-      }
-    } else if (pred.mode === 'embuscade') {
-      // ── EMBUSCADE ──
-      pred.ambushTicks++;
-      const dx = pred.ambushX - pred.x, dy = pred.ambushY - pred.y;
-      const dn = Math.max(Math.hypot(dx,dy), 1);
-      if (dn > 10) {
-        pred.vx = pred.vx*0.7 + (dx/dn)*pred.speed*0.12;
-        pred.vy = pred.vy*0.7 + (dy/dn)*pred.speed*0.12;
-      } else {
-        pred.vx *= 0.8; pred.vy *= 0.8;
-      }
-      if (pred.ambushTicks > 90 + Math.random()*60) {
-        pred.mode = 'rôde';
-        pred.ambushTicks = 0;
-        pred.prevTx = pred.prevTy = null;
-      }
-    } else {
-      // ── RÔDE ──
-      pred.mode = 'rôde';
-      pred.chaseTicks = 0; pred.prevTx = pred.prevTy = null;
-      const pcx = aliveFishes.reduce((s,f)=>s+f.x,0)/aliveFishes.length;
-      const pcy = aliveFishes.reduce((s,f)=>s+f.y,0)/aliveFishes.length;
-      const dx = pcx-pred.x, dy = pcy-pred.y;
-      const dn = Math.max(Math.hypot(dx,dy),1);
-      pred.vx = pred.vx*0.92 + (dx/dn)*pred.speed*0.22 + (Math.random()-0.5)*0.3;
-      pred.vy = pred.vy*0.92 + (dy/dn)*pred.speed*0.22 + (Math.random()-0.5)*0.3;
-    }
-
-    // Clamp vitesse prédateur
-    const pspd = Math.hypot(pred.vx, pred.vy);
-    if (pspd > pred.speed*1.6) { pred.vx *= pred.speed*1.6/pspd; pred.vy *= pred.speed*1.6/pspd; }
-    pred.x = Math.max(5, Math.min(W-5, pred.x + pred.vx));
-    pred.y = Math.max(5, Math.min(H-5, pred.y + pred.vy));
-    if (pspd > 0.05) pred.angle = Math.atan2(pred.vy, pred.vx);
   });
 
-  // ── Poissons ──────────────────────────────────────────────────────────────
+  // ── Prédateur ──────────────────────────────────────────────────────────
+  preds.forEach(pred => stepPredator(pred, aliveFishes));
+
+  // ── Poissons : décisions, physique, faim, peur ───────────────────────────
   fishes.forEach(fish => {
     if (!fish.alive) return;
-    fish.stepsSurvived++;
-    fish.tailPhase += 0.16;
-
-    // Faim
-    fish.hunger = Math.max(0, fish.hunger - HUNGER_DEC);
-    if (fish.hunger <= 0) {
-      fish.alive = false;
-      fish.deathCause = 'starvation';
-      return;
-    }
-
-    const aliveFoods = fish.foodPool.filter(f => !f.eaten);
-
-    // Inputs nourriture
-    let fdDx=0, fdDy=0, fdDist=1;
-    if (aliveFoods.length > 0) {
-      let closest=null, minD2=Infinity;
-      aliveFoods.forEach(f => {
-        const d2 = dist(fish.x,fish.y,f.x,f.y);
-        if (d2 < minD2) { minD2=d2; closest=f; }
-      });
-      fdDx   = (closest.x-fish.x)/W;
-      fdDy   = (closest.y-fish.y)/H;
-      fdDist = Math.min(minD2/(W*0.5), 1);
-    }
-
-    // Inputs prédateur
-    let pdDx=0, pdDy=0, pdDist=1, minPD=Infinity, closestPred=null;
-    preds.forEach(p => {
-      const d = dist(fish.x,fish.y,p.x,p.y);
-      if (d < minPD) { minPD=d; closestPred=p; }
-    });
-    if (closestPred) {
-      pdDx   = (closestPred.x-fish.x)/W;
-      pdDy   = (closestPred.y-fish.y)/H;
-      pdDist = Math.min(minPD/(W*0.5), 1);
-    }
-
-    // Murs
-    const wx = Math.min(fish.x, W-fish.x)/(W*0.5);
-    const wy = Math.min(fish.y, H-fish.y)/(H*0.5);
-
-    // Danger memory
-    const isPredActive = closestPred && closestPred.active;
-    if (isPredActive && minPD < 260) {
-      fish.dangerMem = Math.min(1, fish.dangerMem + 0.18*(1-pdDist));
-    } else {
-      fish.dangerMem = Math.max(0, fish.dangerMem*0.97);
-    }
-
-    // Urgence faim
-    const hungerUrgency = Math.max(0, 1.0 - fish.hunger*2.5);
-
-    // Temps écoulé depuis le dernier repas (sature à 1.0) — permet au
-    // réseau d'apprendre une dynamique anticipative de la faim plutôt
-    // que de réagir seulement quand hungerUrgency explose.
-    fish.timeSinceMeal = Math.min(MEAL_SAT_TICKS, fish.timeSinceMeal + 1);
-    const mealSignal = fish.timeSinceMeal / MEAL_SAT_TICKS;
-
-    const inputs = [
-      fdDx, fdDy, fdDist,
-      pdDx, pdDy, pdDist,
-      wx, wy,
-      fish.vx/MAX_SPD, fish.vy/MAX_SPD,
-      fish.fear,
-      isPredActive ? 1.0 : 0.0,
-      fish.dangerMem,
-      hungerUrgency,
-      mealSignal,
-    ];
-
-    const out = mlpForward(fish.weights, inputs);
-    let ax = (out[3]-out[2])*FISH_SPD;
-    let ay = (out[0]-out[1])*FISH_SPD;
-
-    // Répulsion mur — adoucie, mirroir exact du Python (était force=5.5,
-    // exp=2.2, ce qui pouvait écraser totalement la décision du réseau
-    // dans les coins et bloquer le poisson en oscillation contre le bord).
-    function wallRep(pos, lo, hi, zone=BORDER_ZONE, force=WALL_FORCE, exp=WALL_EXP) {
-      let r=0;
-      const dlo = pos-lo, dhi = hi-pos;
-      if (dlo < zone) r += force*(1-dlo/zone)**exp;
-      if (dhi < zone) r -= force*(1-dhi/zone)**exp;
-      return r;
-    }
-    ax += wallRep(fish.x, 5, W-5);
-    ay += wallRep(fish.y, 5, H-5);
-
-    // Réflexe panique
-    if (isPredActive && minPD < PANIC_DIST) {
-      const dxp=fish.x-closestPred.x, dyp=fish.y-closestPred.y;
-      const d = Math.max(Math.hypot(dxp,dyp),1);
-      ax = (dxp/d)*FISH_SPD*1.6;
-      ay = (dyp/d)*FISH_SPD*1.6;
-    }
-
-    fish.vx = fish.vx*0.50 + ax*0.50;
-    fish.vy = fish.vy*0.50 + ay*0.50;
-    const spd = Math.hypot(fish.vx, fish.vy);
-    if (spd > MAX_SPD) { fish.vx *= MAX_SPD/spd; fish.vy *= MAX_SPD/spd; }
-
-    const prevX=fish.x, prevY=fish.y;
-    fish.x = Math.max(5, Math.min(W-5, fish.x+fish.vx));
-    fish.y = Math.max(5, Math.min(H-5, fish.y+fish.vy));
-    const moved = Math.hypot(fish.x-prevX, fish.y-prevY);
-    fish.distanceTraveled += moved;
-    fish.tailAmp = Math.min(1, fish.tailAmp*0.88 + moved*0.18);
-    if (Math.abs(fish.vx)>0.01||Math.abs(fish.vy)>0.01)
-      fish.angle = Math.atan2(fish.vy, fish.vx);
-
-    // Trail
-    fish.trail.push({x:fish.x, y:fish.y});
-    if (fish.trail.length > 20) fish.trail.shift();
-
-    // Manger (recyclage sur place, anti-superposition dans le pool de la lignée)
-    aliveFoods.forEach(f => {
-      if (!f.eaten && dist(fish.x,fish.y,f.x,f.y) < FISH_R+FOOD_R) {
-        fish.foodEaten++;
-        fish.hunger = Math.min(1.0, fish.hunger+HUNGER_GAIN);
-        fish.mealIntervals.push(fish.timeSinceMeal);
-        if (fish.mealIntervals.length > 30) fish.mealIntervals.shift();
-        fish.timeSinceMeal = 0;
-        // Recycle la même entrée, position anti-superposition
-        f.phase = Math.random()*Math.PI*2;
-        f.type  = Math.floor(Math.random()*3);
-        placeFoodNoOverlap(f, fish.foodPool);
-        // f.eaten reste false : pas de pool infini
-      }
-    });
-
-    // Mort par prédateur
-    preds.forEach(pred => {
-      if (pred.active && dist(fish.x,fish.y,pred.x,pred.y) < FISH_R+PRED_R) {
-        fish.alive = false;
-        fish.deathCause = 'predator';
-      }
-    });
-
-    // Peur
-    if (isPredActive && minPD < 200) {
-      fish.fear = Math.min(1, fish.fear + 0.28*(1-pdDist));
-    } else {
-      fish.fear = Math.max(0, fish.fear - 0.04);
-    }
-    fish.fearAccum += fish.fear;
-    fish.fearAvg = fish.fearAccum / Math.max(fish.stepsSurvived,1);
+    stepFish(fish, aliveFishes);
   });
+
+  // ── Reproduction (après que tout le monde ait bougé) ─────────────────────
+  handleReproduction();
+
+  // ── Mortalité naturelle (vieillesse) ──────────────────────────────────────
+  fishes.forEach(fish => {
+    if (!fish.alive) return;
+    if (fish.age > MAX_AGE) {
+      const p = OLD_AGE_DEATH_RATE * (1 + (fish.age-MAX_AGE)/MAX_AGE);
+      if (Math.random() < p) {
+        fish.alive = false;
+        fish.deathCause = 'old_age';
+        stats.deaths.old_age++;
+      }
+    }
+  });
+
+  // ── Anti-extinction : si la population tombe sous MIN_POP, réintroduire ──
+  const stillAlive = fishes.filter(f=>f.alive).length;
+  if (stillAlive < MIN_POP) {
+    fishes.push(makeFish({ gen: genCounter }));
+    stats.births++;
+  }
+
+  // ── Nettoyage périodique des cadavres trop vieux dans l'historique ───────
+  if (fishes.length > 60) {
+    // Garde tous les vivants + les 20 morts les plus récentes (pour l'UI)
+    const alive = fishes.filter(f=>f.alive);
+    const dead  = fishes.filter(f=>!f.alive).slice(-20);
+    fishes = alive.concat(dead);
+  }
+
+  // ── Historique de population (pour sparkline globale) ─────────────────────
+  if (tick % 20 === 0) {
+    const a = fishes.filter(f=>f.alive);
+    const avgEnergy = a.length ? a.reduce((s,f)=>s+f.energy,0)/a.length : 0;
+    const avgGen    = a.length ? a.reduce((s,f)=>s+f.gen,0)/a.length : 0;
+    stats.popHistory.push({tick, pop:a.length, avgEnergy, avgGen});
+    if (stats.popHistory.length > 250) stats.popHistory.shift();
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Décor statique
+//  Prédateur — mêmes 3 modes que v5, vitesse globale fixe + légère
+//  adaptation à l'audace moyenne de la population (plus la population
+//  est "téméraire" en moyenne, plus le prédateur est rapide — pression
+//  de sélection auto-ajustée).
+// ══════════════════════════════════════════════════════════════
+const AGGRO_R = 230, ABANDON_R = 290, MAX_CHASE_TICKS = 220;
+const PRED_BASE_SPEED = 1.6;
+
+function stepPredator(pred, aliveFishes) {
+  pred.tailPhase += pred.active ? 0.18 : 0.06;
+
+  if (pred.active) {
+    pred.onTimer--;
+    if (pred.onTimer <= 0) {
+      pred.active = false;
+      pred.cooldown = 280 + Math.random()*200;
+      pred.mode = 'rôde';
+      pred.chaseTicks = 0;
+      pred.prevTx = pred.prevTy = null;
+      pred.target = null;
+    }
+  } else {
+    pred.cooldown--;
+    if (pred.cooldown <= 0) {
+      pred.active = true;
+      pred.onTimer = 160 + Math.random()*100;
+      pred.chaseTicks = pred.ambushTicks = 0;
+      pred.prevTx = pred.prevTy = null;
+      pred.mode = 'rôde';
+      const side = Math.floor(Math.random()*4);
+      if      (side===0) { pred.x=8;       pred.y=60+Math.random()*(H-120); }
+      else if (side===1) { pred.x=W-8;     pred.y=60+Math.random()*(H-120); }
+      else if (side===2) { pred.x=60+Math.random()*(W-120); pred.y=8; }
+      else                { pred.x=60+Math.random()*(W-120); pred.y=H-8; }
+      pred.vx = pred.vy = 0;
+    }
+  }
+
+  if (!pred.active || aliveFishes.length === 0) {
+    pred.vx = pred.vx*0.93 + (W/2-pred.x)/W*0.5 + (Math.random()-0.5)*0.6;
+    pred.vy = pred.vy*0.93 + (H/2-pred.y)/H*0.5 + (Math.random()-0.5)*0.6;
+    pred.mode = 'rôde';
+    pred.x = Math.max(5, Math.min(W-5, pred.x + pred.vx));
+    pred.y = Math.max(5, Math.min(H-5, pred.y + pred.vy));
+    if (Math.hypot(pred.vx, pred.vy) > 0.05) pred.angle = Math.atan2(pred.vy, pred.vx);
+    return;
+  }
+
+  // Vitesse : base + bonus selon l'audace moyenne de la population vivante
+  // (population plus téméraire en moyenne → prédateur légèrement plus rapide)
+  const avgBold = aliveFishes.reduce((s,f)=>s+f.temperament.boldness,0)/aliveFishes.length;
+  const targetSpeed = PRED_BASE_SPEED * (0.85 + avgBold*0.35);
+  pred.speed = pred.speed*0.95 + targetSpeed*0.05;
+
+  // Ciblage avec hystérésis
+  let nearest=null, minD=Infinity;
+  aliveFishes.forEach(f => { const d=dist(pred.x,pred.y,f.x,f.y); if (d<minD){minD=d;nearest=f;} });
+  if (!nearest) return;
+
+  let target = pred.target && pred.target.alive ? pred.target : null;
+  if (!target) { target = nearest; pred.prevTx = pred.prevTy = null; }
+  else {
+    const dCur = dist(pred.x,pred.y,target.x,target.y);
+    if (nearest!==target && dist(pred.x,pred.y,nearest.x,nearest.y) < dCur*0.6) {
+      target = nearest; pred.prevTx = pred.prevTy = null;
+    } else minD = dCur;
+  }
+  pred.target = target;
+
+  if (minD < AGGRO_R) {
+    pred.mode = 'chasse';
+    pred.chaseTicks++;
+    pred.ambushTicks = 0;
+
+    let tx=target.x, ty=target.y;
+    if (pred.prevTx !== null) {
+      const h = Math.min(minD/Math.max(pred.speed*1.5,0.1), 18);
+      tx += (tx-pred.prevTx)*h; ty += (ty-pred.prevTy)*h;
+      tx = Math.max(5, Math.min(W-5, tx)); ty = Math.max(5, Math.min(H-5, ty));
+    }
+    pred.prevTx = target.x; pred.prevTy = target.y;
+
+    const dx=tx-pred.x, dy=ty-pred.y;
+    const dn = Math.max(Math.hypot(dx,dy),1);
+    pred.vx = pred.vx*0.50 + (dx/dn)*pred.speed*0.50;
+    pred.vy = pred.vy*0.50 + (dy/dn)*pred.speed*0.50;
+
+    if (minD > ABANDON_R || pred.chaseTicks > MAX_CHASE_TICKS) {
+      pred.mode = 'embuscade';
+      pred.chaseTicks = 0;
+      pred.prevTx = pred.prevTy = null;
+      const pcx = aliveFishes.reduce((s,f)=>s+f.x,0)/aliveFishes.length;
+      const pcy = aliveFishes.reduce((s,f)=>s+f.y,0)/aliveFishes.length;
+      pred.ambushX = (pred.x+pcx)/2; pred.ambushY = (pred.y+pcy)/2;
+      pred.ambushTicks = 0;
+    }
+  } else if (pred.mode === 'embuscade') {
+    pred.ambushTicks++;
+    const dx=pred.ambushX-pred.x, dy=pred.ambushY-pred.y;
+    const dn = Math.max(Math.hypot(dx,dy),1);
+    if (dn>10) {
+      pred.vx = pred.vx*0.7 + (dx/dn)*pred.speed*0.12;
+      pred.vy = pred.vy*0.7 + (dy/dn)*pred.speed*0.12;
+    } else { pred.vx*=0.8; pred.vy*=0.8; }
+    if (pred.ambushTicks > 90+Math.random()*60) {
+      pred.mode='rôde'; pred.ambushTicks=0; pred.prevTx=pred.prevTy=null;
+    }
+  } else {
+    pred.mode = 'rôde';
+    pred.chaseTicks=0; pred.prevTx=pred.prevTy=null;
+    const pcx = aliveFishes.reduce((s,f)=>s+f.x,0)/aliveFishes.length;
+    const pcy = aliveFishes.reduce((s,f)=>s+f.y,0)/aliveFishes.length;
+    const dx=pcx-pred.x, dy=pcy-pred.y;
+    const dn = Math.max(Math.hypot(dx,dy),1);
+    pred.vx = pred.vx*0.92 + (dx/dn)*pred.speed*0.22 + (Math.random()-0.5)*0.3;
+    pred.vy = pred.vy*0.92 + (dy/dn)*pred.speed*0.22 + (Math.random()-0.5)*0.3;
+  }
+
+  const pspd = Math.hypot(pred.vx,pred.vy);
+  if (pspd > pred.speed*1.6) { pred.vx*=pred.speed*1.6/pspd; pred.vy*=pred.speed*1.6/pspd; }
+  pred.x = Math.max(5, Math.min(W-5, pred.x+pred.vx));
+  pred.y = Math.max(5, Math.min(H-5, pred.y+pred.vy));
+  if (pspd>0.05) pred.angle = Math.atan2(pred.vy,pred.vx);
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Poisson — décision, physique, faim, peur
+// ══════════════════════════════════════════════════════════════
+function stepFish(fish, aliveFishes) {
+  const t = fish.temperament;
+  fish.stepsSurvived++;
+  fish.age++;
+  fish.tailPhase += 0.16;
+  if (fish.reproCooldown > 0) fish.reproCooldown--;
+
+  // ── Métabolisme : la faim baisse plus ou moins vite selon le tempérament ──
+  // metabolism=0 (économe) → décroissance ×0.7 ; metabolism=1 (glouton) → ×1.35
+  const hungerDec = (1.0/(2500*0.75)) * (0.7 + t.metabolism*0.65);
+  fish.energy = Math.max(0, fish.energy - hungerDec);
+  if (fish.energy <= 0) {
+    fish.alive = false;
+    fish.deathCause = 'starvation';
+    stats.deaths.starvation++;
+    return;
+  }
+
+  // ── Perception nourriture (avec bruit selon perception) ───────────────────
+  const aliveFoods = foods.filter(f=>!f.eaten);
+  const perceptionNoise = (1-t.perception) * 0.35; // 0 = parfait, 0.35 = bruit fort
+
+  let fdDx=0, fdDy=0, fdDist=1;
+  if (aliveFoods.length>0) {
+    let closest=null, minD2=Infinity;
+    aliveFoods.forEach(f=>{ const d2=dist(fish.x,fish.y,f.x,f.y); if(d2<minD2){minD2=d2;closest=f;} });
+    fdDx = (closest.x-fish.x)/W + (Math.random()-0.5)*perceptionNoise;
+    fdDy = (closest.y-fish.y)/H + (Math.random()-0.5)*perceptionNoise;
+    fdDist = Math.min(minD2/(W*0.5),1) + (Math.random()-0.5)*perceptionNoise*0.5;
+    fdDist = Math.max(0, Math.min(1, fdDist));
+  }
+
+  // ── Perception prédateur (même bruit) ──────────────────────────────────────
+  let pdDx=0, pdDy=0, pdDist=1, minPD=Infinity, closestPred=null;
+  preds.forEach(p=>{ const d=dist(fish.x,fish.y,p.x,p.y); if(d<minPD){minPD=d;closestPred=p;} });
+  if (closestPred) {
+    pdDx = (closestPred.x-fish.x)/W + (Math.random()-0.5)*perceptionNoise;
+    pdDy = (closestPred.y-fish.y)/H + (Math.random()-0.5)*perceptionNoise;
+    pdDist = Math.min(minPD/(W*0.5),1) + (Math.random()-0.5)*perceptionNoise*0.5;
+    pdDist = Math.max(0, Math.min(1, pdDist));
+  }
+
+  // ── Murs ────────────────────────────────────────────────────────────────
+  const wx = Math.min(fish.x, W-fish.x)/(W*0.5);
+  const wy = Math.min(fish.y, H-fish.y)/(H*0.5);
+
+  // ── Input social : direction/densité des voisins proches ──────────────────
+  // Pondéré côté PERCEPTION par socialPull dans l'input lui-même : un poisson
+  // solitaire reçoit un signal social atténué (il "n'y prête pas attention"),
+  // un grégaire reçoit le signal plein.
+  let socDx=0, socDy=0, neighbors=0;
+  aliveFishes.forEach(o=>{
+    if (o===fish) return;
+    const d = dist(fish.x,fish.y,o.x,o.y);
+    if (d < 160 && d > 0.001) { socDx += (o.x-fish.x)/d; socDy += (o.y-fish.y)/d; neighbors++; }
+  });
+  let socSignal = 0;
+  if (neighbors>0) {
+    socDx/=neighbors; socDy/=neighbors;
+    socSignal = Math.hypot(socDx,socDy);
+  }
+  const socWeight = 0.2 + t.socialPull*0.8; // solitaire perçoit 20%, grégaire 100%
+  const socInputX = socDx * socWeight;
+  const socInputY = socDy * socWeight;
+
+  // ── Danger memory ───────────────────────────────────────────────────────
+  const isPredActive = closestPred && closestPred.active;
+  if (isPredActive && minPD < 260) {
+    fish.dangerMem = Math.min(1, fish.dangerMem + 0.18*(1-pdDist));
+  } else {
+    fish.dangerMem = Math.max(0, fish.dangerMem*0.97);
+  }
+
+  // ── Urgence faim + signal temporel ─────────────────────────────────────────
+  const hungerUrgency = Math.max(0, 1.0 - fish.energy*2.5);
+  fish.timeSinceMeal = Math.min(MEAL_SAT_TICKS, fish.timeSinceMeal+1);
+  const mealSignal = fish.timeSinceMeal/MEAL_SAT_TICKS;
+
+  const inputs = [
+    fdDx, fdDy, fdDist,
+    pdDx, pdDy, pdDist,
+    wx, wy,
+    fish.vx/MAX_SPD, fish.vy/MAX_SPD,
+    fish.fear,
+    isPredActive ? 1.0 : 0.0,
+    fish.dangerMem,
+    hungerUrgency,
+    mealSignal,
+    Math.hypot(socInputX, socInputY) * Math.sign(socDx||1)*0, // placeholder removed below
+  ];
+  // Le 16e input encode la direction sociale projetée (vers le groupe = positif)
+  // sous forme d'un signal scalaire signé combinant x et y — on garde le réseau
+  // à 4 sorties (haut/bas/gauche/droite différentiel), donc on injecte le vecteur
+  // social comme DEUX composantes en réutilisant la dernière entrée pour la norme
+  // et en biaisant directement ax/ay après le forward (cf. plus bas), ce qui est
+  // plus simple et plus interprétable qu'un 17e input.
+  inputs[15] = socSignal; // densité/force du groupe perçue [0, ~1]
+
+  const out = mlpForward(fish.weights, inputs);
+  let ax = (out[3]-out[2])*FISH_SPD;
+  let ay = (out[0]-out[1])*FISH_SPD;
+
+  // ── Influence sociale directe sur l'accélération ───────────────────────────
+  // Le réseau reçoit la FORCE du signal social (input 15) et peut apprendre à
+  // y réagir, mais la DIRECTION (vers le centroïde des voisins) est appliquée
+  // comme un terme physique pondéré par socialPull — un grégaire est
+  // mécaniquement tiré vers le groupe, un solitaire ne l'est presque pas.
+  if (neighbors>0) {
+    ax += socDx * socWeight * 0.9;
+    ay += socDy * socWeight * 0.9;
+  }
+
+  // ── Répulsion mur ───────────────────────────────────────────────────────
+  function wallRep(pos, lo, hi, zone=BORDER_ZONE, force=WALL_FORCE, exp=WALL_EXP) {
+    let r=0; const dlo=pos-lo, dhi=hi-pos;
+    if (dlo<zone) r += force*(1-dlo/zone)**exp;
+    if (dhi<zone) r -= force*(1-dhi/zone)**exp;
+    return r;
+  }
+  ax += wallRep(fish.x,5,W-5);
+  ay += wallRep(fish.y,5,H-5);
+
+  // ── Réflexe panique (distance modulée par boldness) ─────────────────────
+  // anxieux (boldness=0) panique dès 130px, téméraire (boldness=1) seulement à 70px
+  const panicDist = PANIC_DIST_BASE * (1.3 - t.boldness*0.6);
+  if (isPredActive && minPD < panicDist) {
+    const dxp=fish.x-closestPred.x, dyp=fish.y-closestPred.y;
+    const d = Math.max(Math.hypot(dxp,dyp),1);
+    ax = (dxp/d)*FISH_SPD*1.6;
+    ay = (dyp/d)*FISH_SPD*1.6;
+  }
+
+  // ── Vitesse max modulée par métabolisme : glouton légèrement plus rapide ──
+  const maxSpd = MAX_SPD * (0.92 + t.metabolism*0.16);
+
+  fish.vx = fish.vx*0.50 + ax*0.50;
+  fish.vy = fish.vy*0.50 + ay*0.50;
+  const spd = Math.hypot(fish.vx,fish.vy);
+  if (spd>maxSpd) { fish.vx*=maxSpd/spd; fish.vy*=maxSpd/spd; }
+
+  const prevX=fish.x, prevY=fish.y;
+  fish.x = Math.max(5, Math.min(W-5, fish.x+fish.vx));
+  fish.y = Math.max(5, Math.min(H-5, fish.y+fish.vy));
+  const moved = Math.hypot(fish.x-prevX, fish.y-prevY);
+  fish.distanceTraveled += moved;
+  fish.tailAmp = Math.min(1, fish.tailAmp*0.88 + moved*0.18);
+  if (Math.abs(fish.vx)>0.01||Math.abs(fish.vy)>0.01) fish.angle = Math.atan2(fish.vy,fish.vx);
+
+  fish.trail.push({x:fish.x,y:fish.y});
+  if (fish.trail.length>20) fish.trail.shift();
+
+  // ── Manger ──────────────────────────────────────────────────────────────
+  // gain légèrement supérieur pour les gloutons (compense leur métabolisme rapide)
+  const hungerGain = HUNGER_GAIN * (0.9 + t.metabolism*0.25);
+  aliveFoods.forEach(f=>{
+    if (!f.eaten && dist(fish.x,fish.y,f.x,f.y) < FISH_R+FOOD_R) {
+      fish.foodEaten++;
+      fish.energy = Math.min(1.0, fish.energy+hungerGain);
+      fish.mealIntervals.push(fish.timeSinceMeal);
+      if (fish.mealIntervals.length>30) fish.mealIntervals.shift();
+      fish.timeSinceMeal = 0;
+      f.eaten = true; // sera respawné ailleurs par la régulation écologique
+    }
+  });
+
+  // ── Mort par prédateur ──────────────────────────────────────────────────
+  preds.forEach(pred=>{
+    if (pred.active && dist(fish.x,fish.y,pred.x,pred.y) < FISH_R+PRED_R) {
+      fish.alive = false;
+      fish.deathCause = 'predator';
+      stats.deaths.predator++;
+    }
+  });
+
+  // ── Peur (montée modulée par boldness) ──────────────────────────────────
+  const fearGain = 0.28 * (1.4 - t.boldness*0.8); // anxieux monte ~1.4×, téméraire ~0.6×
+  if (isPredActive && minPD < 200) {
+    fish.fear = Math.min(1, fish.fear + fearGain*(1-pdDist));
+  } else {
+    fish.fear = Math.max(0, fish.fear - 0.04);
+  }
+  fish.fearAccum += fish.fear;
+  fish.fearAvg = fish.fearAccum/Math.max(fish.stepsSurvived,1);
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Reproduction sexuée
+// ══════════════════════════════════════════════════════════════
+function handleReproduction() {
+  const candidates = fishes.filter(f =>
+    f.alive && f.age > MATURITY_AGE && f.energy > REPRO_ENERGY && f.reproCooldown <= 0
+  );
+  if (candidates.length < 2) return;
+
+  const paired = new Set();
+  for (let i=0;i<candidates.length;i++) {
+    const a = candidates[i];
+    if (paired.has(a.id)) continue;
+    for (let j=i+1;j<candidates.length;j++) {
+      const b = candidates[j];
+      if (paired.has(b.id)) continue;
+      if (dist(a.x,a.y,b.x,b.y) < REPRO_RANGE) {
+        // Reproduction !
+        paired.add(a.id); paired.add(b.id);
+        const childWeights = mutateWeights(crossoverWeights(a.weights,b.weights), MUT_STD);
+        const childTemp    = mutateTemperament(crossoverTemperament(a.temperament,b.temperament));
+        const childGen = Math.max(a.gen,b.gen)+1;
+        genCounter = Math.max(genCounter, childGen);
+
+        a.energy -= REPRO_COST; b.energy -= REPRO_COST;
+        a.reproCooldown = REPRO_COOLDOWN; b.reproCooldown = REPRO_COOLDOWN;
+        a.children++; b.children++;
+
+        fishes.push(makeFish({
+          weights: childWeights,
+          temperament: childTemp,
+          gen: childGen,
+          x: (a.x+b.x)/2 + (Math.random()-0.5)*10,
+          y: (a.y+b.y)/2 + (Math.random()-0.5)*10,
+          energy: 0.55,
+          parents: [a.id,b.id],
+        }));
+        stats.births++;
+        break;
+      }
+    }
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Interprétation comportementale (dashboard)
+// ══════════════════════════════════════════════════════════════
+function behaviourInsight(fish) {
+  const alive = fish.alive;
+  const fe = fish.foodEaten;
+  const steps = fish.stepsSurvived;
+  const fear = fish.fearAvg;
+  const t = fish.temperament;
+
+  if (!alive) {
+    if (fish.deathCause === 'starvation') {
+      if (fe === 0) return "N'a jamais réussi à se nourrir — stratégie non viable.";
+      if (fear > 0.35) return "La peur a dominé : recherche de nourriture trop prudente.";
+      return "A mangé, mais pas assez régulièrement — épuisement progressif.";
+    }
+    if (fish.deathCause === 'predator') {
+      if (fe === 0) return "Tué sans avoir mangé — n'a pas eu le temps d'apprendre.";
+      return `A survécu ${steps} ticks et eu ${fish.children} descendant(s) avant d'être attrapé.`;
+    }
+    if (fish.deathCause === 'old_age') {
+      return `Mort de vieillesse après ${steps} ticks — ${fish.children} descendant(s). Belle longévité.`;
+    }
+  }
+
+  if (steps < 100) return "Phase d'exploration initiale du génome.";
+
+  const foodPerTick = fe/Math.max(steps,1);
+  if (fish.mealIntervals.length >= 4) {
+    const avgGap = fish.mealIntervals.reduce((a,b)=>a+b,0)/fish.mealIntervals.length;
+    if (avgGap < 120 && fear < 0.3) return "✓ Rythme alimentaire régulier — pression de faim maîtrisée.";
+    if (avgGap > 300) return "Repas trop espacés — la faim grimpe dangereusement entre deux prises.";
+  }
+
+  if (fish.children > 0 && fish.energy > REPRO_ENERGY*0.8)
+    return `✓ Stratégie reproductive efficace — ${fish.children} descendant(s), bonne réserve d'énergie.`;
+  if (foodPerTick > 0.015 && fear < 0.2)
+    return "✓ Excellente stratégie alimentaire, peu de peur inutile.";
+  if (foodPerTick < 0.003 && fear > 0.4)
+    return "Paralysé par la peur — survie passive, la faim arrive.";
+  if (t.socialPull > 0.65 && neighborCountOf(fish) >= 2)
+    return "Profil grégaire — suit le groupe, profite de la vigilance collective.";
+  if (t.socialPull < 0.35)
+    return "Profil solitaire — explore seul, moins de compétition directe.";
+
+  return "Comportement stable, en cours d'optimisation.";
+}
+function neighborCountOf(fish) {
+  let n=0;
+  fishes.forEach(o=>{ if(o!==fish && o.alive && dist(fish.x,fish.y,o.x,o.y)<160) n++; });
+  return n;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  Décor statique (identique v5)
 // ══════════════════════════════════════════════════════════════
 const CORALS=[], ROCKS=[], SAND_RIPPLES=[];
 
@@ -609,7 +845,6 @@ function drawBackground() {
   g.addColorStop(.82,'#03101f'); g.addColorStop(1,'#010810');
   ctx.fillStyle=g; ctx.fillRect(0,0,cw,ch);
 
-  // Rayons
   ctx.save();
   for(let i=0;i<6;i++){
     const bx=(0.1+i*0.16)*cw, sw=Math.sin(tick*.0024+i*1.3)*.04*cw, x=bx+sw;
@@ -623,19 +858,17 @@ function drawBackground() {
   }
   ctx.restore();
 
-  // Caustics
   ctx.save(); ctx.globalAlpha=0.022;
   for(let i=0;i<10;i++){
-    const t=tick*.002+i*.55;
-    const x=(0.5+.5*Math.sin(t*1.1))*cw, y=(0.15+.1*Math.sin(t*.9+1))*ch;
-    const r=(18+10*Math.sin(t*.7))*(cw/800);
+    const t2=tick*.002+i*.55;
+    const x=(0.5+.5*Math.sin(t2*1.1))*cw, y=(0.15+.1*Math.sin(t2*.9+1))*ch;
+    const r=(18+10*Math.sin(t2*.7))*(cw/800);
     const gc=ctx.createRadialGradient(x,y,0,x,y,r);
     gc.addColorStop(0,'#3ab4ff'); gc.addColorStop(1,'rgba(58,180,255,0)');
     ctx.fillStyle=gc; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
   }
   ctx.restore();
 
-  // Sable
   const sandY=ch*.87;
   const sg=ctx.createLinearGradient(0,sandY,0,ch);
   sg.addColorStop(0,'#0c1c0f'); sg.addColorStop(.3,'#101808'); sg.addColorStop(1,'#09140e');
@@ -752,7 +985,7 @@ function drawFood() {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  Prédateur requin — avec mode visible
+//  Prédateur requin
 // ══════════════════════════════════════════════════════════════
 function drawPredators() {
   const scX=canvas.width/W, scY=canvas.height/H;
@@ -770,7 +1003,6 @@ function drawPredators() {
     if (isChasing){ctx.shadowBlur=24;ctx.shadowColor='rgba(200,0,0,.55)';}
     else if(isAmbush){ctx.shadowBlur=10;ctx.shadowColor='rgba(140,0,0,.3)';}
 
-    // Queue
     ctx.save(); ctx.rotate(tailSway);
     ctx.beginPath();
     ctx.moveTo(-L*.55,0); ctx.lineTo(-L,-L*.36); ctx.lineTo(-L*.95,0); ctx.lineTo(-L,L*.36);
@@ -778,7 +1010,6 @@ function drawPredators() {
     ctx.fillStyle=isChasing?'#991111':isActive?'#5a1515':'#2d0d0d'; ctx.fill();
     ctx.restore();
 
-    // Corps
     ctx.beginPath();
     ctx.moveTo(L,0);
     ctx.bezierCurveTo(L*.6,-L*.22,-L*.2,-L*.25,-L*.55,-L*.04);
@@ -786,42 +1017,36 @@ function drawPredators() {
     ctx.bezierCurveTo(-L*.2,L*.25,L*.6,L*.22,L,0);
     ctx.fillStyle=isChasing?'#b21515':isActive?'#4a1212':'#2a0d0d'; ctx.fill();
 
-    // Ventre
     ctx.beginPath();
     ctx.moveTo(L*.7,0);ctx.bezierCurveTo(L*.4,-L*.1,-L*.1,-L*.1,-L*.28,-L*.02);
     ctx.bezierCurveTo(-L*.28,L*.02,-L*.1,L*.1,L*.4,L*.1); ctx.closePath();
     ctx.fillStyle=isChasing?'#cc2a2a44':'#3d181844'; ctx.fill();
 
-    // Nageoire dorsale
     ctx.beginPath();
     ctx.moveTo(L*.06,-L*.2);ctx.lineTo(L*.26,-L*.5);ctx.lineTo(L*.4,-L*.22);
     ctx.closePath();
     ctx.fillStyle=isChasing?'#991111':isActive?'#3d1818':'#2a0d0d'; ctx.fill();
 
-    // Nageoire pectorale
     ctx.beginPath();
     ctx.moveTo(L*.2,L*.15);ctx.lineTo(L*.05,L*.42);ctx.lineTo(-L*.12,L*.18);
     ctx.closePath();
     ctx.fillStyle=isActive?'#aa1818':'#300d0d'; ctx.fill();
 
-    // Oeil
     ctx.shadowBlur=0;
     ctx.beginPath();ctx.arc(L*.55,-L*.07,L*.07,0,Math.PI*2);
     ctx.fillStyle='#080808'; ctx.fill();
     ctx.beginPath();ctx.arc(L*.55,-L*.07,L*.03,0,Math.PI*2);
     ctx.fillStyle=isChasing?'#ff1010':isAmbush?'#ff8800':'#333'; ctx.fill();
 
-    // Dents si en chasse
     if(isChasing){
       ctx.globalAlpha=0.65;
-      for(let t=0;t<3;t++){
-        const tx2=L*.87-t*L*.09, tw=L*.04;
+      for(let tt=0;tt<3;tt++){
+        const tx2=L*.87-tt*L*.09, tw=L*.04;
         ctx.beginPath();ctx.moveTo(tx2,-L*.03);ctx.lineTo(tx2-tw,-L*.1);ctx.lineTo(tx2-tw*2,-L*.03);
         ctx.fillStyle='#f0f0f0'; ctx.fill();
       }
     }
 
-    // Icône mode (embuscade = ! )
     if(isAmbush){
       ctx.globalAlpha=0.9; ctx.shadowBlur=0;
       ctx.fillStyle='#ff8800'; ctx.font=`bold ${Math.round(L*.7)}px monospace`;
@@ -839,17 +1064,16 @@ function drawPredators() {
 function drawFish(fish, scX, scY) {
   const sx=fish.x*scX, sy=fish.y*scY;
 
-  // Trail
   if(fish.alive && fish.trail && fish.trail.length>3){
     ctx.save();
     for(let i=1;i<fish.trail.length;i++){
-      const t=i/fish.trail.length;
+      const ti=i/fish.trail.length;
       ctx.beginPath();
       ctx.moveTo(fish.trail[i-1].x*scX, fish.trail[i-1].y*scY);
       ctx.lineTo(fish.trail[i].x*scX,   fish.trail[i].y*scY);
       ctx.strokeStyle=fish.color;
-      ctx.globalAlpha=t*0.065*(fish.fear>0.35?1.6:1);
-      ctx.lineWidth=t*2.2; ctx.stroke();
+      ctx.globalAlpha=ti*0.065*(fish.fear>0.35?1.6:1);
+      ctx.lineWidth=ti*2.2; ctx.stroke();
     }
     ctx.restore();
   }
@@ -857,15 +1081,17 @@ function drawFish(fish, scX, scY) {
   ctx.save(); ctx.translate(sx,sy); ctx.rotate(fish.angle||0);
   const alive=fish.alive;
   ctx.globalAlpha=alive?1:.16;
-  const L=11;
+
+  // Taille croît légèrement avec l'âge jusqu'à maturité (effet "croissance")
+  const growth = Math.min(1, fish.age/MATURITY_AGE);
+  const L = 7 + growth*4; // 7px (juvénile) → 11px (adulte)
+
   const tailSway=alive?Math.sin(fish.tailPhase||0)*(fish.tailAmp||0)*0.75:0;
 
-  // Couleur modifiée par la faim
   let bodyColor=fish.color;
-  if(alive && fish.hunger < 0.35){
-    // Teinte vers le gris/jaune quand affamé
-    const t=1-(fish.hunger/0.35);
-    bodyColor=lerpColor(fish.color,'#888855',t*0.55);
+  if(alive && fish.energy < 0.35){
+    const tt=1-(fish.energy/0.35);
+    bodyColor=lerpColor(fish.color,'#888855',tt*0.55);
   }
 
   const fearGlow=fish.fear>0.4;
@@ -874,47 +1100,40 @@ function drawFish(fish, scX, scY) {
     ctx.shadowColor=fearGlow?'#ff4444':bodyColor;
   }
 
-  // Queue
   ctx.save(); ctx.translate(-L*1.1,0); ctx.rotate(tailSway*.7);
   ctx.beginPath();
   ctx.moveTo(0,0);ctx.lineTo(-L*.72,-L*.68);ctx.lineTo(-L*.38,0);ctx.lineTo(-L*.72,L*.68);
   ctx.closePath(); ctx.fillStyle=bodyColor+'bb'; ctx.fill();
   ctx.restore();
 
-  // Corps
   ctx.beginPath();
   ctx.moveTo(L*1.2,0);
   ctx.bezierCurveTo(L*.8,-L*.6,-L*.5,-L*.68,-L*1.1,0);
   ctx.bezierCurveTo(-L*.5,L*.68,L*.8,L*.6,L*1.2,0);
   ctx.fillStyle=bodyColor; ctx.fill();
 
-  // Reflet ventre
   ctx.beginPath();
   ctx.moveTo(L*.9,0);ctx.bezierCurveTo(L*.5,-L*.27,-L*.2,-L*.28,-L*.68,0);
   ctx.bezierCurveTo(-L*.2,L*.28,L*.5,L*.27,L*.9,0);
   ctx.fillStyle='rgba(255,255,255,0.11)'; ctx.fill();
 
-  // Nageoire dorsale
   ctx.beginPath();
   ctx.moveTo(-L*.28,-L*.48);ctx.quadraticCurveTo(L*.1,-L*.98,L*.48,-L*.5);
   ctx.lineTo(L*.48,-L*.37);ctx.quadraticCurveTo(L*.1,-L*.68,-L*.28,-L*.37);
   ctx.closePath(); ctx.globalAlpha=alive?.68:.14;
   ctx.fillStyle=bodyColor+'aa'; ctx.fill(); ctx.globalAlpha=alive?1:.16;
 
-  // Nageoire anale
   ctx.beginPath();
   ctx.moveTo(-L*.08,L*.40);ctx.quadraticCurveTo(L*.14,L*.82,L*.44,L*.43);
   ctx.lineTo(L*.44,L*.33);ctx.quadraticCurveTo(L*.14,L*.58,-L*.08,L*.30);
   ctx.closePath(); ctx.globalAlpha=alive?.52:.1;
   ctx.fillStyle=bodyColor+'88'; ctx.fill(); ctx.globalAlpha=alive?1:.16;
 
-  // Nageoire pectorale
   ctx.shadowBlur=0;
   ctx.beginPath();ctx.moveTo(L*.38,L*.17);ctx.quadraticCurveTo(L*.68,L*.52,L*.08,L*.48);
   ctx.closePath(); ctx.globalAlpha=alive?.48:.08;
   ctx.fillStyle=bodyColor+'77'; ctx.fill(); ctx.globalAlpha=alive?1:.16;
 
-  // Œil
   ctx.shadowBlur=0;
   ctx.beginPath();ctx.arc(L*.54,-L*.14,L*.21,0,Math.PI*2);
   ctx.fillStyle='#0c190c'; ctx.fill();
@@ -924,7 +1143,6 @@ function drawFish(fish, scX, scY) {
   ctx.beginPath();ctx.arc(L*.58,-L*.17,L*.055,0,Math.PI*2);
   ctx.fillStyle='#090909'; ctx.fill();
 
-  // Écailles
   if(alive){
     ctx.globalAlpha=0.07; ctx.strokeStyle='#fff'; ctx.lineWidth=0.55;
     for(let i=0;i<3;i++){
@@ -933,7 +1151,6 @@ function drawFish(fish, scX, scY) {
     ctx.globalAlpha=1;
   }
 
-  // Barre de peur (rouge)
   if(alive && fish.fear>0.18){
     ctx.shadowBlur=0;
     const bw=L*2.3;
@@ -945,13 +1162,12 @@ function drawFish(fish, scX, scY) {
     ctx.globalAlpha=alive?1:.16;
   }
 
-  // Barre de faim (jaune→rouge)
   if(alive){
     ctx.shadowBlur=0;
     const bw=L*2.3;
-    const h=fish.hunger;
+    const h=fish.energy;
     const hColor = h>0.5 ? '#f0c030' : h>0.25 ? '#e08020' : '#cc2020';
-    ctx.globalAlpha=Math.max(0, 0.85 - h*0.5);  // plus visible quand faim haute
+    ctx.globalAlpha=Math.max(0, 0.85 - h*0.5);
     ctx.fillStyle=hColor;
     ctx.fillRect(-bw/2,-L*1.75,bw*h,2);
     ctx.strokeStyle='rgba(255,255,255,.08)';ctx.lineWidth=.4;
@@ -959,21 +1175,39 @@ function drawFish(fish, scX, scY) {
     ctx.globalAlpha=1;
   }
 
+  // Marqueur de maturité reproductive (petit point vert si prêt à se reproduire)
+  if(alive && fish.age>MATURITY_AGE && fish.energy>REPRO_ENERGY && fish.reproCooldown<=0){
+    ctx.shadowBlur=4; ctx.shadowColor='#39ff8a';
+    ctx.beginPath(); ctx.arc(0, -L*1.95, 1.6, 0, Math.PI*2);
+    ctx.fillStyle='#39ff8a'; ctx.fill();
+    ctx.shadowBlur=0;
+  }
+
   ctx.restore();
 
-  // Label hover
   if(hoveredFish===fish){
     ctx.save(); ctx.globalAlpha=.9;
     ctx.fillStyle=fish.color; ctx.font='10px JetBrains Mono,monospace';
-    ctx.fillText(fish.name,sx+15,sy-15); ctx.restore();
+    ctx.fillText(`#${fish.name||fish.id} g${fish.gen}`,sx+15,sy-15); ctx.restore();
   }
 }
 
 function lerpColor(c1, c2, t) {
-  const r1=parseInt(c1.slice(1,3),16),g1=parseInt(c1.slice(3,5),16),b1=parseInt(c1.slice(5,7),16);
-  const r2=parseInt(c2.slice(1,3),16),g2=parseInt(c2.slice(3,5),16),b2=parseInt(c2.slice(5,7),16);
-  const r=Math.round(r1+(r2-r1)*t),g=Math.round(g1+(g2-g1)*t),b=Math.round(b1+(b2-b1)*t);
-  return '#'+r.toString(16).padStart(2,'0')+g.toString(16).padStart(2,'0')+b.toString(16).padStart(2,'0');
+  // Supporte hex (#rrggbb) — temperamentColor renvoie du hsl(), donc on
+  // convertit via un canvas 1x1 pour rester générique.
+  const a = colorToRgb(c1), b = colorToRgb(c2);
+  const r=Math.round(a[0]+(b[0]-a[0])*t), g=Math.round(a[1]+(b[1]-a[1])*t), bl=Math.round(a[2]+(b[2]-a[2])*t);
+  return `rgb(${r},${g},${bl})`;
+}
+const _colorCache = {};
+function colorToRgb(c) {
+  if (_colorCache[c]) return _colorCache[c];
+  const d = document.createElement('canvas').getContext('2d');
+  d.fillStyle = c; d.fillRect(0,0,1,1);
+  const data = d.getImageData(0,0,1,1).data;
+  const rgb = [data[0],data[1],data[2]];
+  _colorCache[c] = rgb;
+  return rgb;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -987,122 +1221,139 @@ function drawScene() {
   ctx.save(); drawBubbles(); ctx.restore();
   drawFood();
   drawPredators();
-  fishes.forEach(f => drawFish(f, scX, scY));
+  fishes.forEach(f => { if (f.alive) drawFish(f, scX, scY); });
 }
 
 // ══════════════════════════════════════════════════════════════
-//  UI / Dashboard
+//  UI / Dashboard — vue population (remplace les cartes par lignée)
 // ══════════════════════════════════════════════════════════════
 function buildLineageCards() {
-  if (!lineageData) return;
+  // Conservé pour compat de nommage avec le HTML existant, mais la
+  // structure est reconstruite dynamiquement à chaque updateUI car la
+  // population fluctue (naissances/morts).
   const container = document.getElementById('lineageCards');
-  container.innerHTML = '';
-  Object.values(lineageData.lineages).forEach(lin => {
-    const card = document.createElement('div');
-    card.className = 'lineage-card';
-    card.id = 'card-'+lin.name;
-    card.style.setProperty('--lcolor', lin.color);
-    const tags = behaviourTags(lin);
-    const tagHTML = tags.map(t=>
-      `<span class="behav-tag" style="color:${t.color};border-color:${t.color}33">${t.text}</span>`
-    ).join(' ');
-    card.innerHTML = `
-      <div class="lineage-header">
-        <span class="lineage-name">${lin.name}</span>
-        <span class="lineage-status" id="status-${lin.name}">vivant</span>
-      </div>
-      <div class="stat-row"><span>fitness évol.</span><span class="stat-val">${lin.final_fitness.toFixed(3)}</span></div>
-      <div class="stat-row"><span>nourriture</span><span class="stat-val" id="food-${lin.name}">0</span></div>
-      <div class="stat-row"><span>survie</span><span class="stat-val" id="steps-${lin.name}">0 t</span></div>
-      <div class="stat-row"><span>peur moy.</span><span class="stat-val" id="fear-${lin.name}">0%</span></div>
-      <div class="hunger-bar-wrap">
-        <span style="font-size:9px;color:var(--muted)">faim</span>
-        <div class="hunger-bar-bg">
-          <div class="hunger-bar-fill" id="hunger-${lin.name}" style="width:100%;background:#f0c030"></div>
-        </div>
-        <span class="hunger-label" id="hunger-pct-${lin.name}">100%</span>
-      </div>
-      ${tagHTML}
-      <div class="behav-insight" id="insight-${lin.name}">Initialisation…</div>
-      <canvas class="sparkline" id="spark-${lin.name}" height="26"></canvas>
-    `;
-    container.appendChild(card);
-    requestAnimationFrame(() => drawSparkline(lin));
-  });
+  if (container) container.innerHTML = '<div style="font-size:9px;color:var(--muted)">Population en cours d\'initialisation…</div>';
 }
 
-function drawSparkline(lin) {
-  const cvs = document.getElementById('spark-'+lin.name);
+function traitBar(label, value, lowLabel, highLabel) {
+  const pct = Math.round(value*100);
+  return `
+    <div class="stat-row" style="margin-bottom:1px">
+      <span style="width:70px">${label}</span>
+      <div class="hunger-bar-bg" style="flex:1;margin:0 5px">
+        <div class="hunger-bar-fill" style="width:${pct}%;background:#00b4d8"></div>
+      </div>
+      <span style="font-size:8px;color:var(--muted);width:60px;text-align:right">${pct<50?lowLabel:highLabel}</span>
+    </div>`;
+}
+
+function updateUI(force=false) {
+  const alive = fishes.filter(f=>f.alive);
+  const pop = alive.length;
+
+  document.getElementById('gTick').textContent = tick;
+  document.getElementById('gAlive').textContent = `${pop} (max gén. ${genCounter})`;
+  document.getElementById('gFood').textContent  = foods.filter(f=>!f.eaten).length + '/' + foods.length;
+  const pred = preds[0];
+  if (pred) {
+    const modeLabels = {'chasse':'⚡ chasse','embuscade':'👁 embuscade','rôde':'~ rôde'};
+    document.getElementById('gPred').textContent =
+      pred.active ? (modeLabels[pred.mode]||pred.mode) + ` (v${pred.speed.toFixed(2)})` : '· inactif';
+  }
+
+  const container = document.getElementById('lineageCards');
+  if (!container) return;
+
+  // ── Stats globales de population ──────────────────────────────────────
+  const avgEnergy = pop ? alive.reduce((s,f)=>s+f.energy,0)/pop : 0;
+  const avgAge    = pop ? alive.reduce((s,f)=>s+f.age,0)/pop : 0;
+  const avgTemp = {perception:0,metabolism:0,socialPull:0,boldness:0};
+  alive.forEach(f=>{ for(const k in avgTemp) avgTemp[k]+=f.temperament[k]; });
+  for (const k in avgTemp) avgTemp[k] = pop ? avgTemp[k]/pop : 0;
+
+  let html = `
+    <div class="lineage-card" style="border-left-color:#00b4d8">
+      <div class="lineage-header">
+        <span class="lineage-name" style="color:#00b4d8">Population</span>
+        <span class="lineage-status">${pop} vivants</span>
+      </div>
+      <div class="stat-row"><span>naissances cumul.</span><span class="stat-val">${stats.births}</span></div>
+      <div class="stat-row"><span>morts (faim)</span><span class="stat-val">${stats.deaths.starvation}</span></div>
+      <div class="stat-row"><span>morts (prédateur)</span><span class="stat-val">${stats.deaths.predator}</span></div>
+      <div class="stat-row"><span>morts (vieillesse)</span><span class="stat-val">${stats.deaths.old_age}</span></div>
+      <div class="stat-row"><span>énergie moy.</span><span class="stat-val">${Math.round(avgEnergy*100)}%</span></div>
+      <div class="stat-row"><span>âge moyen</span><span class="stat-val">${Math.round(avgAge)}t</span></div>
+      <div class="section-title" style="margin-top:8px">tempérament moyen (pop.)</div>
+      ${traitBar('perception', avgTemp.perception, 'myope', 'clairvoyant')}
+      ${traitBar('métabolisme', avgTemp.metabolism, 'économe', 'glouton')}
+      ${traitBar('social', avgTemp.socialPull, 'solitaire', 'grégaire')}
+      ${traitBar('hardiesse', avgTemp.boldness, 'anxieux', 'téméraire')}
+      <canvas class="sparkline" id="spark-pop" height="26"></canvas>
+    </div>
+  `;
+
+  // ── Individus (vivants, triés par énergie décroissante, max 12 affichés) ──
+  const sorted = alive.slice().sort((a,b)=>b.energy-a.energy).slice(0,12);
+  sorted.forEach(fish => {
+    const tags = [];
+    if (fish.age>MATURITY_AGE && fish.energy>REPRO_ENERGY && fish.reproCooldown<=0)
+      tags.push({text:'PRÊT À SE REPRODUIRE',color:'#39ff8a'});
+    if (fish.fear>0.4) tags.push({text:'PEUR ÉLEVÉE',color:'#e74c3c'});
+    const tagHTML = tags.map(tg=>`<span class="behav-tag" style="color:${tg.color};border-color:${tg.color}33">${tg.text}</span>`).join(' ');
+
+    html += `
+      <div class="lineage-card" style="--lcolor:${fish.color}">
+        <div class="lineage-header">
+          <span class="lineage-name" style="color:${fish.color}">#${fish.id} <span style="font-size:9px;color:var(--muted)">gén.${fish.gen}</span></span>
+          <span class="lineage-status">${temperamentLabel(fish.temperament)}</span>
+        </div>
+        <div class="stat-row"><span>âge</span><span class="stat-val">${fish.age}t</span></div>
+        <div class="stat-row"><span>nourriture</span><span class="stat-val">${fish.foodEaten}</span></div>
+        <div class="stat-row"><span>descendants</span><span class="stat-val">${fish.children}</span></div>
+        <div class="hunger-bar-wrap">
+          <span style="font-size:9px;color:var(--muted)">énergie</span>
+          <div class="hunger-bar-bg">
+            <div class="hunger-bar-fill" style="width:${Math.round(fish.energy*100)}%;background:${fish.energy>0.5?'#f0c030':fish.energy>0.25?'#e08020':'#cc2020'}"></div>
+          </div>
+          <span class="hunger-label">${Math.round(fish.energy*100)}%</span>
+        </div>
+        ${tagHTML}
+        <div class="behav-insight">${behaviourInsight(fish)}</div>
+      </div>
+    `;
+  });
+
+  container.innerHTML = html;
+  requestAnimationFrame(drawPopSparkline);
+}
+
+function drawPopSparkline() {
+  const cvs = document.getElementById('spark-pop');
   if (!cvs) return;
   cvs.width = cvs.offsetWidth; cvs.height = 26;
   const c = cvs.getContext('2d');
-  const data = lin.history.map(h=>h.best);
-  if (!data.length) return;
-  const mx = Math.max(...data, 0.01);
+  const data = stats.popHistory.map(h=>h.pop);
+  if (data.length<2) return;
+  const mx = Math.max(...data, 1);
   const cw=cvs.width, ch=cvs.height;
   c.clearRect(0,0,cw,ch);
   const grad=c.createLinearGradient(0,0,0,ch);
-  grad.addColorStop(0,lin.color+'2a'); grad.addColorStop(1,'transparent');
+  grad.addColorStop(0,'#00b4d82a'); grad.addColorStop(1,'transparent');
   c.fillStyle=grad; c.beginPath();
   data.forEach((v,i)=>{
     const x=(i/(data.length-1))*cw, y=ch-(v/mx)*ch*.86-2;
     i===0?c.moveTo(x,ch):undefined;
-    i===0?c.lineTo(x,y):c.lineTo(x,y);
+    c.lineTo(x,y);
   });
   c.lineTo(cw,ch); c.closePath(); c.fill();
-  c.strokeStyle=lin.color; c.lineWidth=1.4;
-  c.shadowBlur=5; c.shadowColor=lin.color; c.globalAlpha=.82;
+  c.strokeStyle='#00b4d8'; c.lineWidth=1.4;
+  c.shadowBlur=5; c.shadowColor='#00b4d8'; c.globalAlpha=.82;
   c.beginPath();
   data.forEach((v,i)=>{
     const x=(i/(data.length-1))*cw, y=ch-(v/mx)*ch*.86-2;
     i===0?c.moveTo(x,y):c.lineTo(x,y);
   });
   c.stroke();
-}
-
-function updateUI(force=false) {
-  const alive = fishes.filter(f=>f.alive).length;
-  document.getElementById('gTick').textContent = tick;
-  document.getElementById('gAlive').textContent = `${alive}/${fishes.length}`;
-  document.getElementById('gFood').textContent  = foods.filter(f=>!f.eaten).length;
-  const pred = preds[0];
-  if (pred) {
-    const modeLabels = {'chasse':'⚡ chasse','embuscade':'👁 embuscade','rôde':'~ rôde'};
-    document.getElementById('gPred').textContent =
-      pred.active ? (modeLabels[pred.mode]||pred.mode) : '· inactif';
-  }
-
-  fishes.forEach(fish => {
-    const sEl  = document.getElementById('status-'+fish.name);
-    const fEl  = document.getElementById('food-'+fish.name);
-    const stEl = document.getElementById('steps-'+fish.name);
-    const feEl = document.getElementById('fear-'+fish.name);
-    const hBar = document.getElementById('hunger-'+fish.name);
-    const hPct = document.getElementById('hunger-pct-'+fish.name);
-    const ins  = document.getElementById('insight-'+fish.name);
-
-    if (sEl) {
-      const deathLabel = fish.deathCause === 'starvation' ? '✕ famine' : '✕ prédateur';
-      sEl.textContent  = fish.alive ? '● vivant' : deathLabel;
-      sEl.style.color  = fish.alive ? '#2ecc71' : (fish.deathCause==='starvation'?'#e67e22':'#e74c3c');
-    }
-    if (fEl)  fEl.textContent  = fish.foodEaten;
-    if (stEl) stEl.textContent = fish.stepsSurvived+'t';
-    if (feEl) feEl.textContent = Math.round(fish.fearAvg*100)+'%';
-
-    if (hBar && hPct) {
-      const hp = Math.round(fish.hunger*100);
-      hBar.style.width = hp+'%';
-      hBar.style.background = fish.hunger > 0.5 ? '#f0c030' : fish.hunger > 0.25 ? '#e08020' : '#cc2020';
-      hPct.textContent = hp+'%';
-    }
-
-    // Insight : mise à jour toutes les 2s ou si mort récente
-    if (ins && (force || !fish.alive || tick - lastInsightUpdate > 120)) {
-      ins.textContent = behaviourInsight(fish);
-    }
-  });
-  if (force || tick - lastInsightUpdate > 120) lastInsightUpdate = tick;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1119,18 +1370,17 @@ canvas.addEventListener('mousemove', e => {
     tooltip.style.left=(e.clientX-rect.left+16)+'px';
     tooltip.style.top=(e.clientY-rect.top+16)+'px';
     const f=hoveredFish;
-    const fd={rich:'abondante',normal:'normale',sparse:'rare'};
-    const c=f.context;
+    const t=f.temperament;
     tooltip.innerHTML=`
-      <b style="color:${f.color}">${f.name}</b><br>
-      nourriture : <b>${f.foodEaten}</b> (${fd[c&&c.food]||'?'})<br>
-      faim : <b>${Math.round(f.hunger*100)}%</b><br>
+      <b style="color:${f.color}">#${f.id}</b> · gén. ${f.gen} · ${temperamentLabel(t)}<br>
+      âge : <b>${f.age}t</b> · énergie : <b>${Math.round(f.energy*100)}%</b><br>
+      nourriture : <b>${f.foodEaten}</b> · descendants : <b>${f.children}</b><br>
       depuis dernier repas : ${Math.round(f.timeSinceMeal)}t<br>
-      peur actuelle : <b>${Math.round(f.fear*100)}%</b><br>
-      peur moyenne : ${Math.round(f.fearAvg*100)}%<br>
+      peur : ${Math.round(f.fear*100)}% (moy. ${Math.round(f.fearAvg*100)}%)<br>
       danger memory : ${Math.round(f.dangerMem*100)}%<br>
-      vitesse prédateur (cible) : ${preds[0]&&preds[0].target===f ? preds[0].speed.toFixed(2) : '—'}<br>
-      fitness évol : ${f.finalFitness.toFixed(3)}
+      perception ${Math.round(t.perception*100)}% · métabolisme ${Math.round(t.metabolism*100)}%<br>
+      social ${Math.round(t.socialPull*100)}% · hardiesse ${Math.round(t.boldness*100)}%
+      ${f.parents ? `<br>parents : #${f.parents[0]} × #${f.parents[1]}` : ''}
     `;
   } else {
     tooltip.style.display='none';
@@ -1163,24 +1413,10 @@ function loop(ts) {
   requestAnimationFrame(loop);
 }
 
-async function init() {
+function init() {
   generateDecor();
-  try {
-    const res = await fetch('lineages.json');
-    lineageData = await res.json();
-    buildLineageCards();
-    spawnWorld();
-    updateUI(true);
-    requestAnimationFrame(loop);
-  } catch(e) {
-    document.body.innerHTML+=`
-      <div style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
-        background:#020810;border:1px solid #e74c3c;padding:24px 32px;
-        color:#e74c3c;font-family:monospace;border-radius:4px;text-align:center">
-        ⚠ lineages.json introuvable<br><br>
-        <span style="color:#888">Lance d'abord :</span><br>
-        <code style="color:#aaa">python evolution.py</code>
-      </div>`;
-  }
+  spawnWorld();
+  updateUI(true);
+  requestAnimationFrame(loop);
 }
 init();
