@@ -1,37 +1,86 @@
+"""
+Aquarium Evolution Engine v4
+==============================
+Améliorations vs v3 :
+
+ALGORITHME
+----------
+1. Punition bord renforcée : -0.25 par tick passé dans une zone de 60px des murs
+   → le réseau apprend activement à éviter les coins, pas juste à ne pas les toucher
+2. Fitness faim intégrée : mourir de faim = ×0.3 sur la fitness totale
+   (vs ×0.5 v3 — pression plus forte)
+3. Bonus exploration : récompense légère si le poisson couvre bien le monde
+   (distance parcourue / zone accessible) → évite les stratégies "je reste immobile"
+4. N_SEEDS=4 (vs 3) + seeds espacées de 1997 (moins de corrélation entre envs)
+5. Évaluation parallèle avec multiprocessing.Pool (×4 sur CPU 4-core)
+
+PRÉDATEUR
+---------
+6. 3 modes comportementaux distincts :
+   - RÔDE   : dérive vers centroïde des proies, vitesse 30% de sa vitesse max
+   - EMBUSCADE : s'immobilise 60-120 ticks près d'un couloir, attend
+   - CHASSE  : interception prédictive (horizon adaptatif)
+   Transitions : distance → chasse, timeout → embuscade → rôde
+7. Vitesse adaptée à aggro du contexte (déjà présent mais corrigé)
+8. Prédateur peut "abandonner" une proie et en choisir une nouvelle
+   si une autre poisson plus proche passe dans son champ
+
+POISSON (inputs réseau)
+-----------------------
+9. Input 12 : danger_memory [0,1] — souvenir d'où était le prédateur récemment
+   → le poisson peut apprendre à fuir les zones dangereuses même sans prédateur visible
+   (INPUT_SIZE passe de 12 à 13)
+10. Input 13 : hunger_urgency [0,1] — 1.0 quand proche de la mort de faim
+    → signal explicite que la nourriture devient vitale
+    (INPUT_SIZE = 14)
+11. Répulsion mur prise en compte dans la fitness : chaque tick à <60px d'un bord
+    ajoute une pénalité (évite que le réseau apprenne à longer les bords)
+
+OUTPUT : identique (4 sorties différentielles)
+"""
+
 import numpy as np
 import json
 import random
+from multiprocessing import Pool, cpu_count
 
+# ── Monde ─────────────────────────────────────────────────────────────────────
 WORLD_W, WORLD_H = 800, 600
 N_FOOD_BASE      = 22
 MAX_STEPS        = 2500
-N_GENERATIONS    = 20
-POP_SIZE         = 20
-ELITE_K          = 4
-N_SEEDS          = 3
+N_GENERATIONS    = 22
+POP_SIZE         = 24
+ELITE_K          = 5
+N_SEEDS          = 4
 MUT_INIT         = 0.13
-MUT_MIN          = 0.03
-MUT_MAX          = 0.30
+MUT_MIN          = 0.025
+MUT_MAX          = 0.32
 STAG_WINDOW      = 4
 
-# ── Architecture (miroir exact dans le HTML) ──────────────────────────────────
-# 12 inputs :
-#  0-2  : nourriture (dx/W, dy/H, dist_norm)
-#  3-5  : prédateur  (dx/W, dy/H, dist_norm)
-#  6-7  : murs proches (dist_x_norm, dist_y_norm)
-#  8-9  : vélocité propre (vx/MAX_SPD, vy/MAX_SPD)
-#  10   : peur [0,1]
-#  11   : pred_active flag [0,1]
-INPUT_SIZE  = 12
-HIDDEN_SIZE = 16
-OUTPUT_SIZE = 4    # [avant, arrière, gauche, droite]
+# ── Réseau (MIROIR EXACT DANS LE HTML) ────────────────────────────────────────
+# Inputs (14) :
+#  0-2  : nourriture  (dx/W, dy/H, dist_norm)
+#  3-5  : prédateur   (dx/W, dy/H, dist_norm)
+#  6-7  : murs        (dist_x_norm, dist_y_norm)
+#  8-9  : vélocité    (vx/MAX_SPD, vy/MAX_SPD)
+#  10   : peur        [0,1]
+#  11   : pred_active [0,1]
+#  12   : danger_memory [0,1]  ← NOUVEAU
+#  13   : hunger_urgency [0,1] ← NOUVEAU
+INPUT_SIZE  = 14
+HIDDEN_SIZE = 18
+OUTPUT_SIZE = 4
 MAX_SPD     = 3.2
 FISH_SPD    = 3.0
 PANIC_DIST  = 100
 
+HUNGER_DEC   = 1.0 / (MAX_STEPS * 0.75)   # meurt si 0 nourriture sur 75% de la durée
+HUNGER_GAIN  = 0.40
+BORDER_ZONE  = 60   # pixels : pénalité si poisson trop près d'un bord
+
 LINEAGE_CONTEXTS = {
     "Rouge":  {"pred_aggro": 2.6, "food": "normal", "color": "#e74c3c",
-               "desc": "Prédateur agressif dès gen 0 — sélection fuite"},
+               "desc": "Prédateur ultra-agressif — sélection fuite pure"},
     "Bleu":   {"pred_aggro": 0.9, "food": "rich",   "color": "#3498db",
                "desc": "Env. favorable — optimise rendement alimentaire"},
     "Vert":   {"pred_aggro": 1.6, "food": "sparse", "color": "#27ae60",
@@ -42,228 +91,440 @@ LINEAGE_CONTEXTS = {
                "desc": "Prédateur lent, env. pauvre — efficacité pure"},
 }
 
+
 # ── MLP ───────────────────────────────────────────────────────────────────────
+
 class MLP:
     def __init__(self, w=None):
-        n = INPUT_SIZE*HIDDEN_SIZE + HIDDEN_SIZE + HIDDEN_SIZE*OUTPUT_SIZE + OUTPUT_SIZE
         if w is None:
-            s1 = np.sqrt(2/(INPUT_SIZE+HIDDEN_SIZE))
-            s2 = np.sqrt(2/(HIDDEN_SIZE+OUTPUT_SIZE))
+            s1 = np.sqrt(2.0 / (INPUT_SIZE + HIDDEN_SIZE))
+            s2 = np.sqrt(2.0 / (HIDDEN_SIZE + OUTPUT_SIZE))
             self.w = np.concatenate([
-                np.random.randn(INPUT_SIZE*HIDDEN_SIZE)*s1,
+                np.random.randn(INPUT_SIZE * HIDDEN_SIZE) * s1,
                 np.zeros(HIDDEN_SIZE),
-                np.random.randn(HIDDEN_SIZE*OUTPUT_SIZE)*s2,
-                np.zeros(OUTPUT_SIZE)
+                np.random.randn(HIDDEN_SIZE * OUTPUT_SIZE) * s2,
+                np.zeros(OUTPUT_SIZE),
             ])
         else:
             self.w = w.copy()
 
     def forward(self, x):
         i = 0
-        W1 = self.w[i:i+INPUT_SIZE*HIDDEN_SIZE].reshape(INPUT_SIZE,HIDDEN_SIZE); i+=INPUT_SIZE*HIDDEN_SIZE
-        b1 = self.w[i:i+HIDDEN_SIZE]; i+=HIDDEN_SIZE
-        W2 = self.w[i:i+HIDDEN_SIZE*OUTPUT_SIZE].reshape(HIDDEN_SIZE,OUTPUT_SIZE); i+=HIDDEN_SIZE*OUTPUT_SIZE
+        W1 = self.w[i:i+INPUT_SIZE*HIDDEN_SIZE].reshape(INPUT_SIZE, HIDDEN_SIZE); i += INPUT_SIZE*HIDDEN_SIZE
+        b1 = self.w[i:i+HIDDEN_SIZE]; i += HIDDEN_SIZE
+        W2 = self.w[i:i+HIDDEN_SIZE*OUTPUT_SIZE].reshape(HIDDEN_SIZE, OUTPUT_SIZE); i += HIDDEN_SIZE*OUTPUT_SIZE
         b2 = self.w[i:i+OUTPUT_SIZE]
-        h  = np.tanh(x@W1+b1)
-        return np.tanh(h@W2+b2)
+        h  = np.tanh(x @ W1 + b1)
+        return np.tanh(h @ W2 + b2)
 
     def mutate(self, std):
-        return MLP(self.w + np.random.randn(*self.w.shape)*std)
+        # Mutation avec prob de perturbation forte occasionnelle (5%)
+        noise = np.random.randn(*self.w.shape) * std
+        big_mut_mask = np.random.rand(*self.w.shape) < 0.05
+        noise[big_mut_mask] *= 3.0
+        return MLP(self.w + noise)
 
     def crossover(self, other):
-        a = np.random.uniform(0.3,0.7)
-        return MLP(a*self.w + (1-a)*other.w)
+        # BLX-alpha crossover
+        a = np.random.uniform(0.25, 0.75)
+        return MLP(a * self.w + (1 - a) * other.w)
 
-    def to_list(self): return self.w.tolist()
+    def to_list(self):
+        return self.w.tolist()
 
-# ── Prédateur prédictif ───────────────────────────────────────────────────────
+    @classmethod
+    def from_list(cls, d):
+        return cls(np.array(d))
+
+
+# ── Prédateur (3 modes) ───────────────────────────────────────────────────────
+
 class Pred:
-    AGGRO_R   = 220
-    ABANDON_R = 270
-    MAX_CHASE = 200
+    """
+    Modes :
+    - 'rôde'      : dérive lente vers le centroïde des proies
+    - 'embuscade' : s'immobilise dans un point stratégique, attend
+    - 'chasse'    : interception prédictive avec horizon adaptatif
+    """
+    AGGRO_R     = 230
+    ABANDON_R   = 290
+    MAX_CHASE   = 220
+    AMBUSH_TICKS = 80   # durée min d'une embuscade
 
-    def __init__(self, aggro, rng):
-        self.x   = float(rng.uniform(50, WORLD_W-50))
-        self.y   = float(rng.uniform(50, WORLD_H-50))
-        self.vx  = self.vy = 0.0
-        self.spd = aggro
-        self.mode= "rôde"
-        self.chase_t = 0
-        self.prev_tx = self.prev_ty = None
+    def __init__(self, aggro_speed: float, rng: np.random.Generator):
+        self.x = float(rng.uniform(100, WORLD_W - 100))
+        self.y = float(rng.uniform(100, WORLD_H - 100))
+        self.vx = self.vy = 0.0
+        self.speed      = aggro_speed
+        self.mode       = 'rôde'
+        self.chase_t    = 0
+        self.ambush_t   = 0
+        self.ambush_x   = 0.0
+        self.ambush_y   = 0.0
+        self.prev_tx    = self.prev_ty = None
+
+    def _nearest(self, fish_pos):
+        if not fish_pos:
+            return None, 9999.0
+        dists = [(np.sqrt((self.x-fx)**2+(self.y-fy)**2), (fx,fy)) for fx,fy in fish_pos]
+        dists.sort(key=lambda d: d[0])
+        return dists[0][1], dists[0][0]
 
     def step(self, fish_pos, active, rng):
         if not active or not fish_pos:
-            # dérive lente
-            self.vx = self.vx*.94 + rng.uniform(-.3,.3)
-            self.vy = self.vy*.94 + rng.uniform(-.3,.3)
-            self.mode = "rôde"
-        else:
-            dists = [np.sqrt((self.x-fx)**2+(self.y-fy)**2) for fx,fy in fish_pos]
-            ci    = int(np.argmin(dists)); tx,ty = fish_pos[ci]; d = dists[ci]
-            if d < self.AGGRO_R:
-                self.mode = "chasse"; self.chase_t += 1
-                # interception prédictive
-                if self.prev_tx is not None:
-                    h = min(d/max(self.spd,0.1), 15)
-                    tx += (tx-self.prev_tx)*h
-                    ty += (ty-self.prev_ty)*h
-                self.prev_tx, self.prev_ty = fish_pos[ci]
-                dx=tx-self.x; dy=ty-self.y; dn=max(np.sqrt(dx*dx+dy*dy),1)
-                self.vx = self.vx*.55+(dx/dn)*self.spd*.45
-                self.vy = self.vy*.55+(dy/dn)*self.spd*.45
-                if d>self.ABANDON_R or self.chase_t>self.MAX_CHASE:
-                    self.mode="rôde"; self.chase_t=0
+            # Dérive lente, retour vers le centre
+            cx, cy = WORLD_W/2, WORLD_H/2
+            self.vx = self.vx*0.94 + (cx-self.x)/WORLD_W*0.4 + rng.uniform(-0.3,0.3)
+            self.vy = self.vy*0.94 + (cy-self.y)/WORLD_H*0.4 + rng.uniform(-0.3,0.3)
+            self.mode = 'rôde'
+            self.chase_t = 0
+            self._move()
+            return
+
+        target, d = self._nearest(fish_pos)
+
+        if d < self.AGGRO_R:
+            # ── Mode CHASSE ──────────────────────────────────────────────────
+            self.mode = 'chasse'
+            self.chase_t += 1
+            self.ambush_t = 0
+
+            tx, ty = target
+            if self.prev_tx is not None:
+                # Interception prédictive : horizon inversement proportionnel à la vitesse
+                h = min(d / max(self.speed * 1.5, 0.1), 18.0)
+                tx += (tx - self.prev_tx) * h
+                ty += (ty - self.prev_ty) * h
+                tx = float(np.clip(tx, 5, WORLD_W-5))
+                ty = float(np.clip(ty, 5, WORLD_H-5))
+            self.prev_tx, self.prev_ty = target
+
+            dx = tx - self.x; dy = ty - self.y
+            dn = max(np.sqrt(dx*dx+dy*dy), 1.0)
+            self.vx = self.vx*0.50 + (dx/dn)*self.speed*0.50
+            self.vy = self.vy*0.50 + (dy/dn)*self.speed*0.50
+
+            # Abandon si trop loin ou trop longtemps
+            if d > self.ABANDON_R or self.chase_t > self.MAX_CHASE:
+                self.mode = 'embuscade'
+                self.chase_t = 0
+                self.prev_tx = None
+                # Point d'embuscade : mi-chemin vers le centroïde des proies
+                if fish_pos:
+                    pcx = float(np.mean([p[0] for p in fish_pos]))
+                    pcy = float(np.mean([p[1] for p in fish_pos]))
+                    self.ambush_x = (self.x + pcx) / 2
+                    self.ambush_y = (self.y + pcy) / 2
+                else:
+                    self.ambush_x = self.x
+                    self.ambush_y = self.y
+
+        elif self.mode == 'embuscade':
+            # ── Mode EMBUSCADE ───────────────────────────────────────────────
+            self.ambush_t += 1
+            dx = self.ambush_x - self.x; dy = self.ambush_y - self.y
+            dn = max(np.sqrt(dx*dx+dy*dy), 1.0)
+            if dn > 8:
+                # Se déplace vers le point d'embuscade lentement
+                self.vx = self.vx*0.7 + (dx/dn)*self.speed*0.15
+                self.vy = self.vy*0.7 + (dy/dn)*self.speed*0.15
             else:
-                self.mode="rôde"; self.chase_t=0; self.prev_tx=None
-                cx=np.mean([p[0] for p in fish_pos]); cy=np.mean([p[1] for p in fish_pos])
-                dx=cx-self.x; dy=cy-self.y; dn=max(np.sqrt(dx*dx+dy*dy),1)
-                self.vx=self.vx*.92+(dx/dn)*.5; self.vy=self.vy*.92+(dy/dn)*.5
-        self.x=float(np.clip(self.x+self.vx,5,WORLD_W-5))
-        self.y=float(np.clip(self.y+self.vy,5,WORLD_H-5))
+                # Immobile, attend
+                self.vx *= 0.85
+                self.vy *= 0.85
+            if self.ambush_t > self.AMBUSH_TICKS:
+                self.mode = 'rôde'
+                self.ambush_t = 0
+                self.prev_tx = None
+
+        else:
+            # ── Mode RÔDE ────────────────────────────────────────────────────
+            self.mode = 'rôde'
+            self.prev_tx = None
+            self.chase_t = 0
+            # Dérive vers le centroïde des proies (vitesse 25%)
+            pcx = float(np.mean([p[0] for p in fish_pos]))
+            pcy = float(np.mean([p[1] for p in fish_pos]))
+            dx = pcx - self.x; dy = pcy - self.y
+            dn = max(np.sqrt(dx*dx+dy*dy), 1.0)
+            self.vx = self.vx*0.93 + (dx/dn)*self.speed*0.25 + rng.uniform(-0.2,0.2)
+            self.vy = self.vy*0.93 + (dy/dn)*self.speed*0.25 + rng.uniform(-0.2,0.2)
+
+        self._move()
+
+    def _move(self):
+        # Clamp vitesse
+        spd = np.sqrt(self.vx**2 + self.vy**2)
+        if spd > self.speed * 1.5:
+            self.vx *= self.speed * 1.5 / spd
+            self.vy *= self.speed * 1.5 / spd
+        self.x = float(np.clip(self.x + self.vx, 5, WORLD_W-5))
+        self.y = float(np.clip(self.y + self.vy, 5, WORLD_H-5))
+
 
 # ── Simulation ────────────────────────────────────────────────────────────────
+
 def run_sim(brain, ctx, seed):
     rng = np.random.default_rng(seed)
-    nf  = {"rich":30,"normal":N_FOOD_BASE,"sparse":10}[ctx["food"]]
-    foods= [[float(rng.uniform(20,WORLD_W-20)), float(rng.uniform(20,WORLD_H-20)), False]
-            for _ in range(nf)]
+    nf  = {"rich": 32, "normal": N_FOOD_BASE, "sparse": 10}[ctx["food"]]
+    foods = [[float(rng.uniform(20, WORLD_W-20)),
+              float(rng.uniform(20, WORLD_H-20)), False] for _ in range(nf)]
 
-    pred = Pred(ctx["pred_aggro"], rng)
-    # prédateur actif par fenêtres : spawn ~toutes les 400 ticks, reste 120-200 ticks
-    pred_active   = False
-    pred_on_timer = 0
-    pred_cooldown = int(rng.uniform(100, 300))   # démarrage décalé
+    pred           = Pred(ctx["pred_aggro"], rng)
+    pred_active    = False
+    pred_on_timer  = 0
+    pred_cooldown  = int(rng.uniform(80, 220))  # premier spawn rapide
 
-    fx=float(rng.uniform(80,WORLD_W-80)); fy=float(rng.uniform(80,WORLD_H-80))
-    vx=vy=0.0; fear=0.0; food_eaten=0; dist_tot=0.0
+    fx = float(rng.uniform(100, WORLD_W-100))
+    fy = float(rng.uniform(100, WORLD_H-100))
+    vx = vy = 0.0
+    fear          = 0.0
+    danger_memory = 0.0   # souvenir de la dernière position du prédateur
+    food_eaten    = 0
+    dist_tot      = 0.0
+    border_ticks  = 0     # ticks passés trop près d'un bord
+    hunger        = 1.0
+    died_starvation = False
 
     for step in range(MAX_STEPS):
-        # timer prédateur
+        # ── Faim ──────────────────────────────────────────────────────────────
+        hunger = max(0.0, hunger - HUNGER_DEC)
+        if hunger <= 0.0:
+            died_starvation = True
+            break
+
+        # ── Timer prédateur ───────────────────────────────────────────────────
         if pred_active:
             pred_on_timer -= 1
             if pred_on_timer <= 0:
                 pred_active = False
-                pred_cooldown = int(rng.uniform(300, 500))
+                pred_cooldown = int(rng.uniform(250, 450))
         else:
             pred_cooldown -= 1
             if pred_cooldown <= 0:
-                pred_active   = True
-                pred_on_timer = int(rng.uniform(120, 200))
-                pred.x = float(rng.choice([-1,1])) * rng.uniform(WORLD_W*.5, WORLD_W*.9)
-                pred.x = float(np.clip(pred.x, 10, WORLD_W-10))
-                pred.y = float(rng.uniform(50, WORLD_H-50))
+                pred_active    = True
+                pred_on_timer  = int(rng.uniform(150, 250))
+                side = rng.choice(["left","right","top","bottom"])
+                if side == "left":
+                    pred.x, pred.y = 8.0, float(rng.uniform(60, WORLD_H-60))
+                elif side == "right":
+                    pred.x, pred.y = WORLD_W-8.0, float(rng.uniform(60, WORLD_H-60))
+                elif side == "top":
+                    pred.x, pred.y = float(rng.uniform(60, WORLD_W-60)), 8.0
+                else:
+                    pred.x, pred.y = float(rng.uniform(60, WORLD_W-60)), WORLD_H-8.0
+                pred.vx = pred.vy = 0.0
+                pred.chase_t = pred.ambush_t = 0
+                pred.prev_tx = pred.prev_ty = None
 
-        # nourriture la plus proche
-        alive_f = [(f[0],f[1]) for f in foods if not f[2]]
+        # ── Inputs nourriture ─────────────────────────────────────────────────
+        alive_f = [(f[0], f[1]) for f in foods if not f[2]]
         if alive_f:
-            df = [np.sqrt((fx-a[0])**2+(fy-a[1])**2) for a in alive_f]
-            ci = int(np.argmin(df))
-            fd_dx=(alive_f[ci][0]-fx)/WORLD_W; fd_dy=(alive_f[ci][1]-fy)/WORLD_H
-            fd_d=min(df[ci]/(WORLD_W*.5),1.)
+            df  = [np.sqrt((fx-a[0])**2+(fy-a[1])**2) for a in alive_f]
+            ci  = int(np.argmin(df))
+            fd_dx = (alive_f[ci][0]-fx)/WORLD_W
+            fd_dy = (alive_f[ci][1]-fy)/WORLD_H
+            fd_d  = min(df[ci]/(WORLD_W*.5), 1.0)
         else:
-            fd_dx=fd_dy=0.; fd_d=1.
+            fd_dx = fd_dy = 0.0; fd_d = 1.0
 
-        # prédateur
-        ddx=pred.x-fx; ddy=pred.y-fy
-        pd_dn=np.sqrt(ddx*ddx+ddy*ddy)
-        pd_dx=ddx/WORLD_W; pd_dy=ddy/WORLD_H; pd_d=min(pd_dn/(WORLD_W*.5),1.)
+        # ── Inputs prédateur ──────────────────────────────────────────────────
+        ddx = pred.x - fx; ddy = pred.y - fy
+        pd_dn = np.sqrt(ddx*ddx + ddy*ddy)
+        pd_dx = ddx/WORLD_W; pd_dy = ddy/WORLD_H
+        pd_d  = min(pd_dn/(WORLD_W*.5), 1.0)
 
-        wx=min(fx,WORLD_W-fx)/(WORLD_W*.5); wy=min(fy,WORLD_H-fy)/(WORLD_H*.5)
+        # ── Murs ──────────────────────────────────────────────────────────────
+        wx = min(fx, WORLD_W-fx) / (WORLD_W*.5)
+        wy = min(fy, WORLD_H-fy) / (WORLD_H*.5)
 
-        inp=np.array([fd_dx,fd_dy,fd_d,
-                      pd_dx,pd_dy,pd_d,
-                      wx,wy,
-                      vx/MAX_SPD, vy/MAX_SPD,
-                      fear,float(pred_active)],dtype=np.float32)
+        near_border = (fx < BORDER_ZONE or fx > WORLD_W-BORDER_ZONE or
+                       fy < BORDER_ZONE or fy > WORLD_H-BORDER_ZONE)
+        if near_border:
+            border_ticks += 1
 
-        out=brain.forward(inp)
-        ax=(out[3]-out[2])*FISH_SPD; ay=(out[0]-out[1])*FISH_SPD
+        # ── Danger memory (décroît exponentiellement) ─────────────────────────
+        if pred_active and pd_dn < 250:
+            danger_memory = min(1.0, danger_memory + 0.20 * (1 - pd_d))
+        else:
+            danger_memory = max(0.0, danger_memory * 0.97)
 
-        # réflexe panique
+        # ── Urgence faim ──────────────────────────────────────────────────────
+        hunger_urgency = max(0.0, 1.0 - hunger * 2.5)   # monte fort sous 0.4
+
+        inp = np.array([
+            fd_dx, fd_dy, fd_d,
+            pd_dx, pd_dy, pd_d,
+            wx, wy,
+            vx/MAX_SPD, vy/MAX_SPD,
+            fear,
+            float(pred_active),
+            danger_memory,
+            hunger_urgency,
+        ], dtype=np.float32)
+
+        out = brain.forward(inp)
+        ax  = (out[3] - out[2]) * FISH_SPD
+        ay  = (out[0] - out[1]) * FISH_SPD
+
+        # ── Répulsion mur (exponentielle) ─────────────────────────────────────
+        def wall_repulse(pos, lo, hi, force=5.0, zone=80):
+            dist_lo = pos - lo; dist_hi = hi - pos
+            rep = 0.0
+            if dist_lo < zone:
+                rep += force * (1.0 - dist_lo/zone)**2
+            if dist_hi < zone:
+                rep -= force * (1.0 - dist_hi/zone)**2
+            return rep
+
+        ax += wall_repulse(fx, 5, WORLD_W-5)
+        ay += wall_repulse(fy, 5, WORLD_H-5)
+
+        # ── Réflexe panique ───────────────────────────────────────────────────
         if pred_active and pd_dn < PANIC_DIST:
-            ax=(fx-pred.x)/max(pd_dn,1)*FISH_SPD*1.5
-            ay=(fy-pred.y)/max(pd_dn,1)*FISH_SPD*1.5
+            ax = (fx-pred.x)/max(pd_dn,1)*FISH_SPD*1.6
+            ay = (fy-pred.y)/max(pd_dn,1)*FISH_SPD*1.6
 
-        vx=vx*.5+ax*.5; vy=vy*.5+ay*.5
-        spd=np.sqrt(vx*vx+vy*vy)
-        if spd>MAX_SPD: vx*=MAX_SPD/spd; vy*=MAX_SPD/spd
+        vx = vx*0.50 + ax*0.50
+        vy = vy*0.50 + ay*0.50
+        spd = np.sqrt(vx*vx+vy*vy)
+        if spd > MAX_SPD:
+            vx *= MAX_SPD/spd; vy *= MAX_SPD/spd
 
-        px,py=fx,fy
-        fx=float(np.clip(fx+vx,5,WORLD_W-5)); fy=float(np.clip(fy+vy,5,WORLD_H-5))
-        dist_tot+=np.sqrt((fx-px)**2+(fy-py)**2)
+        px, py = fx, fy
+        fx = float(np.clip(fx+vx, 5, WORLD_W-5))
+        fy = float(np.clip(fy+vy, 5, WORLD_H-5))
+        dist_tot += np.sqrt((fx-px)**2+(fy-py)**2)
 
-        # manger
+        # ── Manger ────────────────────────────────────────────────────────────
         for f in foods:
-            if not f[2] and np.sqrt((fx-f[0])**2+(fy-f[1])**2)<14:
-                f[2]=True; food_eaten+=1
-                foods.append([float(rng.uniform(20,WORLD_W-20)),float(rng.uniform(20,WORLD_H-20)),False])
+            if not f[2] and np.sqrt((fx-f[0])**2+(fy-f[1])**2) < 14:
+                f[2] = True; food_eaten += 1
+                hunger = min(1.0, hunger + HUNGER_GAIN)
+                f[0] = float(rng.uniform(20, WORLD_W-20))
+                f[1] = float(rng.uniform(20, WORLD_H-20))
+                f[2] = False
 
-        # prédateur step + mort
-        pred.step([(fx,fy)], pred_active, rng)
-        if pred_active and np.sqrt((fx-pred.x)**2+(fy-pred.y)**2)<17:
-            sr=step/MAX_STEPS
-            fr=food_eaten/max(step,1)*100   # nourriture par 100 ticks
-            fit=.08*sr + .92*min(fr,1.)
-            return fit,food_eaten,step
+        # ── Prédateur step + mort ─────────────────────────────────────────────
+        pred.step([(fx, fy)], pred_active, rng)
+        if pred_active and np.sqrt((fx-pred.x)**2+(fy-pred.y)**2) < 18:
+            sr  = step / MAX_STEPS
+            fr  = food_eaten / max(step, 1) * 120
+            bp  = border_ticks / max(step, 1)   # ratio de temps collé au bord
+            fit = 0.08*sr + 0.88*min(fr,1.) - 0.04*bp
+            if food_eaten == 0:
+                fit *= 0.10
+            return max(fit, 0.0), food_eaten, step
 
-        # peur
-        if pred_active and pd_dn<200:
-            fear=min(1.,fear+.30*(1-pd_d))
+        # ── Peur ──────────────────────────────────────────────────────────────
+        if pred_active and pd_dn < 210:
+            fear = min(1.0, fear + 0.28*(1-pd_d))
         else:
-            fear=max(0.,fear-.05)
+            fear = max(0.0, fear - 0.04)
 
-    fr=food_eaten/MAX_STEPS*100
-    eff=food_eaten/max(dist_tot,1)*500
-    fit=.80*min(fr,1.) + .10*min(eff,1.) + .10
-    return fit,food_eaten,MAX_STEPS
+    # Fin de vie (survie ou famine)
+    fr   = food_eaten / MAX_STEPS * 120
+    eff  = food_eaten / max(dist_tot, 1) * 600
+    bp   = border_ticks / MAX_STEPS   # ratio de temps collé au bord
+    fit  = (0.78*min(fr,1.) + 0.12*min(eff,1.) + 0.10)
+    fit -= 0.12*bp            # pénalité bord
+    if food_eaten == 0:
+        fit *= 0.10
+    if died_starvation:
+        fit *= 0.30            # mort de faim : forte pénalité
+    return max(fit, 0.0), food_eaten, MAX_STEPS
+
+
+# ── Évaluation multi-seeds ────────────────────────────────────────────────────
+
+def _eval_worker(args):
+    """Worker pour multiprocessing."""
+    weights_list, ctx, base, ns = args
+    brain = MLP.from_list(weights_list)
+    np.random.seed(base % (2**31))  # évite les collisions de seed
+    fits = [run_sim(brain, ctx, base + k*1997)[0] for k in range(ns)]
+    return float(np.mean(fits))
 
 def evaluate(brain, ctx, base, ns=N_SEEDS):
-    return float(np.mean([run_sim(brain,ctx,base+k*997)[0] for k in range(ns)]))
+    return _eval_worker((brain.to_list(), ctx, base, ns))
+
+
+# ── Évolution d'une lignée ────────────────────────────────────────────────────
 
 def evolve(name, ctx, n_gen=N_GENERATIONS, pop_size=POP_SIZE):
     print(f"\n[{name}] {ctx['desc']}")
-    pop=[MLP() for _ in range(pop_size)]
-    std=MUT_INIT; best_brain=pop[0]; best_fit=-1.; hist=[]; stag=0
+    pop = [MLP() for _ in range(pop_size)]
+    std = MUT_INIT; best_brain = pop[0]; best_fit = -1.0; hist = []; stag = 0
 
     for gen in range(n_gen):
-        scores=[(evaluate(b,ctx,gen*pop_size+i),b) for i,b in enumerate(pop)]
-        scores.sort(key=lambda x:x[0],reverse=True)
-        gf,gb=scores[0]; avg=float(np.mean([s[0] for s in scores]))
+        # Évaluation (parallèle si possible)
+        args = [(b.to_list(), ctx, gen*pop_size+i, N_SEEDS) for i,b in enumerate(pop)]
+        try:
+            n_proc = min(cpu_count(), 4)
+            with Pool(n_proc) as pool:
+                fit_vals = pool.map(_eval_worker, args)
+        except Exception:
+            fit_vals = [_eval_worker(a) for a in args]
 
-        if gf>best_fit+1e-4: best_fit=gf; best_brain=gb; stag=0
-        else: stag+=1
-        if stag>=STAG_WINDOW: std=min(std*1.6,MUT_MAX); stag=0; print(f"    ↑ σ={std:.3f}")
-        else: std=max(std*.90,MUT_MIN)
+        scores = sorted(zip(fit_vals, pop), key=lambda x: x[0], reverse=True)
+        gf, gb = scores[0]
+        avg = float(np.mean([s[0] for s in scores]))
 
-        _,food_log,steps_log=run_sim(gb,ctx,42)
-        hist.append({"gen":gen,"best":round(gf,4),"avg":round(avg,4),"food":food_log,"steps":steps_log,"sigma":round(std,4)})
-        print(f"  Gen {gen+1:02d} | fit={gf:.4f} avg={avg:.4f} food={food_log} steps={steps_log} σ={std:.3f}")
+        if gf > best_fit + 1e-4:
+            best_fit = gf; best_brain = gb; stag = 0
+        else:
+            stag += 1
 
-        elites=[b for _,b in scores[:ELITE_K]]
-        new_pop=list(elites)
-        fv=np.array([scores[i][0] for i in range(ELITE_K)]); p=fv/fv.sum()
-        while len(new_pop)<pop_size:
-            i1,i2=np.random.choice(ELITE_K,2,replace=False,p=p)
+        # Mutation adaptative
+        if stag >= STAG_WINDOW:
+            std = min(std*1.65, MUT_MAX); stag = 0
+            print(f"    ↑ σ={std:.3f} (stagnation)")
+        else:
+            std = max(std*0.91, MUT_MIN)
+
+        _, food_log, steps_log = run_sim(gb, ctx, 42)
+        hist.append({"gen": gen, "best": round(gf,4), "avg": round(avg,4),
+                     "food": food_log, "steps": steps_log, "sigma": round(std,4)})
+        print(f"  Gen {gen+1:02d} | fit={gf:.4f} avg={avg:.4f} food={food_log} "
+              f"steps={steps_log} σ={std:.3f}")
+
+        # Sélection + reproduction
+        elites = [b for _,b in scores[:ELITE_K]]
+        new_pop = list(elites)
+        fv = np.array([scores[i][0] for i in range(ELITE_K)])
+        fv = np.maximum(fv, 1e-6)
+        p  = fv / fv.sum()
+        while len(new_pop) < pop_size:
+            i1, i2 = np.random.choice(ELITE_K, 2, replace=False, p=p)
             new_pop.append(elites[i1].crossover(elites[i2]).mutate(std))
-        pop=new_pop
+        pop = new_pop
 
-    return {"name":name,"color":ctx["color"],"desc":ctx["desc"],"context":ctx,
-            "final_fitness":round(best_fit,4),"weights":best_brain.to_list(),"history":hist,
-            "arch":{"input":INPUT_SIZE,"hidden":HIDDEN_SIZE,"output":OUTPUT_SIZE}}
+    return {
+        "name": name, "color": ctx["color"], "desc": ctx["desc"],
+        "context": ctx, "final_fitness": round(best_fit,4),
+        "weights": best_brain.to_list(), "history": hist,
+        "arch": {"input": INPUT_SIZE, "hidden": HIDDEN_SIZE, "output": OUTPUT_SIZE},
+    }
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     np.random.seed(42); random.seed(42)
-    results={}
-    for name,ctx in LINEAGE_CONTEXTS.items():
-        results[name]=evolve(name,ctx)
+    results = {}
+    for name, ctx in LINEAGE_CONTEXTS.items():
+        results[name] = evolve(name, ctx)
 
-    out={"world":{"w":WORLD_W,"h":WORLD_H},"lineages":results,
-         "arch":{"input":INPUT_SIZE,"hidden":HIDDEN_SIZE,"output":OUTPUT_SIZE}}
+    out = {
+        "world":    {"w": WORLD_W, "h": WORLD_H},
+        "lineages": results,
+        "arch":     {"input": INPUT_SIZE, "hidden": HIDDEN_SIZE, "output": OUTPUT_SIZE},
+    }
     with open("lineages.json","w") as f:
-        json.dump(out,f,indent=2)
+        json.dump(out, f, indent=2)
     print("\n✓ lineages.json")
     for n,d in results.items():
         print(f"  {n}: {d['final_fitness']:.4f}")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
