@@ -4,7 +4,7 @@ Browser-based neuroevolution simulation. Agents (fish) evolve foraging and
 predator-avoidance strategies entirely at runtime — no training data, no gradient descent.
 Evolution happens through sexual reproduction, crossover, and mutation across 30+ generations.
 
-**[▶ Live demo](https://imeneamel.github.io/aquarium-neuroevolution/aquarium.html)**
+**[▶ Live demo](https://imeneamel.github.io/neuroevolution_aquarium/aquarium.html)**
 
 ---
 
